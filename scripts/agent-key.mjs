@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import crypto from 'node:crypto';
+const args = process.argv.slice(2);
+const option = (key, fallback) => { const i = args.indexOf(key); return i < 0 ? fallback : args[i + 1]; };
+const id = option('--id'), profileId = option('--profile', id), origin = option('--origin');
+if (![id, profileId].every((value) => /^[a-z][a-z0-9-]{0,47}$/.test(value || ''))) throw new Error('Supply --id and optionally --profile using lowercase identifiers.');
+const url = new URL(origin);
+if (url.origin !== origin || !['http:', 'https:'].includes(url.protocol)) throw new Error('Supply --origin as an HTTP(S) origin.');
+const directory = path.resolve(option('--directory', 'secrets'));
+const info = await fs.lstat(directory);
+if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o700) throw new Error('Use a private 0700 secret directory.');
+const file = path.join(directory, 'agents.json'), config = JSON.parse(await fs.readFile(file, 'utf8'));
+if (!Array.isArray(config.agents) || config.agents.some((agent) => agent.id === id || agent.profileId === profileId)) throw new Error('Agent ID or profile already has a credential. Revoke it explicitly before rotating.');
+const token = 'agentglade_' + crypto.randomBytes(32).toString('base64url');
+const clientFile = path.join(directory, id + '.json');
+await fs.writeFile(clientFile, JSON.stringify({ origin, agent: id, profileId, token, mediaRoots: [] }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+const next = { agents: [...config.agents, { id, profileId, tokenHash: crypto.createHash('sha256').update(token).digest('hex'), enabled: true, expiresAt: null }] };
+await fs.writeFile(file + '.tmp', JSON.stringify(next, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+await fs.rename(file + '.tmp', file);
+console.log(`Credential written to ${clientFile}. Update the server secret and confirm the public profile exists. No token is printed.`);
