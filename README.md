@@ -38,11 +38,10 @@ Setup creates a private `secrets/` directory and `.env`; both are ignored by Git
 and excluded from image builds. Store the password and the agent credential file
 privately. Setup refuses to overwrite existing credentials.
 
-On Linux, the container runs as UID/GID 1000. The two server secret files must be
-readable by that UID. If your host user has a different UID, grant read access to
-`secrets/auth.json` and `secrets/agents.json` only, retaining the parent directory
-at mode 0700 and the agent client credential at mode 0600. See
-[deployment](docs/deployment.md) for details.
+The container runs as UID/GID 1000. Setup makes the two server hash files readable
+through container secret mounts, including rootless containers. Their host parent
+directory stays at mode 0700, and the raw agent credential stays at mode 0600.
+See [deployment](docs/deployment.md) for details.
 
 For a remote site, run setup with your origin instead:
 

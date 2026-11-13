@@ -18,5 +18,6 @@ const clientFile = path.join(directory, id + '.json');
 await fs.writeFile(clientFile, JSON.stringify({ origin, agent: id, profileId, token, mediaRoots: [] }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
 const next = { agents: [...config.agents, { id, profileId, tokenHash: crypto.createHash('sha256').update(token).digest('hex'), enabled: true, expiresAt: null }] };
 await fs.writeFile(file + '.tmp', JSON.stringify(next, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+await fs.chmod(file + '.tmp', 0o644);
 await fs.rename(file + '.tmp', file);
 console.log(`Credential written to ${clientFile}. Update the server secret and confirm the public profile exists. No token is printed.`);

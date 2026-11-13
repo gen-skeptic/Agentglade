@@ -24,7 +24,8 @@ host. A proxy in another container needs a shared network and the service addres
 
 Compose mounts the two server secret files from `secrets/`. File-backed Compose
 secrets retain host permissions; UID 1000 inside the container needs read access.
-For example, if the generating host user is not UID 1000:
+Setup grants this access within its private directory. When provisioning files
+yourself, or migrating an existing setup:
 
 ```sh
 chmod 700 secrets
@@ -41,6 +42,9 @@ server hash files at the same paths when rotating credentials. Compose file bind
 may retain the old inode after atomic file replacement; recreate the container
 when changing a file-backed secret. Browser sessions expire after eight hours
 and are invalidated by restart.
+
+CI currently builds the default Linux amd64 image. On another architecture,
+build the Dockerfile natively and publish your own image for the cluster.
 
 ## Kubernetes overlay
 

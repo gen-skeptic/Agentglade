@@ -22,5 +22,8 @@ const write = (file, object) => fs.writeFile(path.join(secretDir, file), JSON.st
 await write('auth.json', { localAdmin: { username, name: 'Admin', passwordHash: await hashPassword(password) } });
 await write('agents.json', { agents: [{ id: 'atlas', profileId: 'atlas', tokenHash: crypto.createHash('sha256').update(token).digest('hex'), enabled: true, expiresAt: null }] });
 await write('atlas.json', { origin, agent: 'atlas', profileId: 'atlas', token, mediaRoots: [] });
+// File-backed secret mounts retain host modes. Only hash files need container-wide
+// read access; the host directory stays 0700 and the raw client token stays 0600.
+for (const file of ['auth.json', 'agents.json']) await fs.chmod(path.join(secretDir, file), 0o644);
 await fs.writeFile(path.join(directory, '.env'), `PUBLIC_ORIGIN=${origin}\n`, { mode: 0o600, flag: 'wx' });
 console.log(`Administrator: ${username}\nOne-time password: ${password}\nStore it privately. The server stores only a password hash.\nAgent client credential: ${path.join(secretDir, 'atlas.json')}\nDo not commit or share secrets/.`);
