@@ -216,7 +216,7 @@ async function init() {
   if (editId) {
     try {
       original = await loadPost(editId);
-      if (session?.role === 'contributor' && original.authorId !== session.user) throw new Error('You can only edit your own posts. Choose one from Past posts.');
+      if (original.canEdit === false) throw new Error('You can only edit your own posts. Choose one from Past posts.');
       $('#edit-context').textContent = `Editing a post by ${original.author}. Your changes appear on the public feed after saving.`;
       $('#edit-context').hidden = false;
     } catch (error) {

@@ -114,6 +114,9 @@ class HttpError extends Error {
 const fail = (status, message) => { throw new HttpError(status, message); };
 const version = (post) => crypto.createHash('sha256').update(JSON.stringify(post)).digest('hex');
 const editable = (post) => ({ ...post, version: version(post) });
+// What a signed-in member sees: the stored author subject (an SSO account ID) stays
+// private, and the server says whether this viewer may edit or delete the post.
+const postView = (post, who) => { const { authorId, ...shown } = post; return { ...shown, version: version(post), canEdit: community.canEdit(who, post) }; };
 function checkVersion(req, post) {
   if (!req.headers['if-match']) fail(428, 'Reload this post before changing it.');
   if (req.headers['if-match'] !== `"${version(post)}"`) fail(412, 'This post changed in another window. Reload the latest post before saving or deleting.');
@@ -339,7 +342,7 @@ async function createPost(req, res, who) {
       return post;
     });
   } catch (err) { await removeUnused(media); throw err; }
-  return send(res, 201, editable(post));
+  return send(res, 201, postView(post, who));
 }
 
 const agentRates = new Map();
@@ -444,7 +447,7 @@ async function updatePost(req, res, who, id) {
       return updated;
     });
   } catch (err) { await removeUnused(added); throw err; }
-  return send(res, 200, editable(post));
+  return send(res, 200, postView(post, who));
 }
 
 async function deletePost(req, res, who, id) {
@@ -463,7 +466,7 @@ async function deletePost(req, res, who, id) {
   return send(res, 204, '');
 }
 
-function listPosts(doc, url) {
+function listPosts(doc, url, who) {
   let before;
   if (url.searchParams.has('before')) {
     try { before = JSON.parse(Buffer.from(url.searchParams.get('before'), 'base64url').toString()); }
@@ -475,7 +478,7 @@ function listPosts(doc, url) {
   const remaining = before ? posts.filter((p) => Date.parse(p.publishedAt) < before.time || (Date.parse(p.publishedAt) === before.time && p.id.localeCompare(before.id) < 0)) : posts;
   const page = remaining.slice(0, limit);
   const last = page.at(-1);
-  return { posts: page.map(editable), total: posts.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
+  return { posts: page.map((post) => postView(post, who)), total: posts.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
 }
 
 /* ---------- static files ---------- */
@@ -573,7 +576,7 @@ const server = http.createServer(async (req, res) => {
       }
       const profileMatch = /^\/api\/profiles\/([a-z][a-z0-9-]{0,47})$/.exec(pathname);
       if (profileMatch && req.method === 'PUT') return await updateProfile(req, res, who, profileMatch[1]);
-      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(await readPosts(), url));
+      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(await readPosts(), url, who));
       if (pathname === '/api/posts' && req.method === 'POST') return await createPost(req, res, who);
       const match = /^\/api\/posts\/([^/]+)$/.exec(pathname);
       if (match) {
@@ -584,7 +587,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET') {
           const post = (await readPosts()).posts.find((p) => p.id === id);
           if (!post) fail(404, 'This post no longer exists.');
-          return send(res, 200, editable(post), { ETag: `"${version(post)}"` });
+          return send(res, 200, postView(post, who), { ETag: `"${version(post)}"` });
         }
       }
       return send(res, 404, { error: 'Not found.' });

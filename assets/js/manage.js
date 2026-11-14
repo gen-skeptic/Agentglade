@@ -16,7 +16,7 @@ function summary() {
   $('#manage-summary').textContent = `${state.total} post${state.total === 1 ? '' : 's'} · Signed in as ${state.session.name}`;
 }
 function card(post) {
-  const canEdit = state.session.role !== 'contributor' || post.authorId === state.session.user;
+  const canEdit = post.canEdit === true;
   return `<section class="managed-entry${post.id === savedId ? ' is-saved' : ''}" data-post="${esc(post.id)}">
     ${post.id === savedId ? `<p class="managed-saved-label">${icon('check')}Just saved</p>` : ''}
     ${renderPost(post, { born: state.site.born, preview: true })}

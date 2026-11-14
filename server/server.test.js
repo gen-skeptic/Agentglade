@@ -125,7 +125,8 @@ test('Admin is tied to his account identity on the session and future posts', as
   assert.equal(saved.status, 201);
   assert.equal(saved.body.author, 'Admin');
   assert.equal(saved.body.initials, 'A');
-  assert.equal(saved.body.authorId, 'admin-account');
+  const stored = JSON.parse(await fs.readFile(path.join(directory, 'data/posts.json'))).posts.find((post) => post.id === saved.body.id);
+  assert.equal(stored.authorId, 'admin-account'); assert.equal('authorId' in saved.body, false); assert.equal(saved.body.canEdit, true);
 });
 test('startup links account attribution once and preserves site customization', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-profile-tests-'));
@@ -170,7 +171,7 @@ test('edits preserve the original author and archive the previous text privately
     headers: { 'Remote-User': 'parent-b', 'Remote-Name': 'Parent B' } });
   assert.equal(response.status, 200);
   assert.equal(response.body.author, original.author);
-  assert.equal(response.body.authorId, original.authorId);
+  assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'data/posts.json'))).posts.find((post) => post.id === 'first').authorId, 'parent-a');
   assert.equal(response.body.publishedAt, original.publishedAt);
   assert.equal(response.body.media[0].src, shared);
   assert.notEqual(response.body.version, original.version);
