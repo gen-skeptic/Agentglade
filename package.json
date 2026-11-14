@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server/server.js",
+    "demo": "node scripts/demo.mjs",
     "setup": "node scripts/setup.mjs",
     "test": "node --test server/*.test.js"
   },
