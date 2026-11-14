@@ -28,7 +28,11 @@ Do not forward or reveal it to browsers. Restart Agentglade after auth changes.
 Without a configured marker hash, all identity headers are ignored.
 
 For individually approved users, configure `MEMBER_ACCOUNTS` and optionally
-`MEMBER_ADMINS` as private deployment settings. For group membership, configure
+`MEMBER_ADMINS` as private deployment settings. A `profileId` binds that subject
+to an existing public profile at the next start, including accounts added after
+the first deployment. Once bound, an account's profile never changes
+automatically, and a profile already bound to another account is not reassigned;
+that account gets its own new profile instead and the server logs a warning. For group membership, configure
 `MEMBER_ROLES`. Group matches are exact; a generic administrator claim or matching
 display name does not create application administration. Namespace prefixes
 `local:` and `agent:` are reserved and cannot be asserted by a proxy.
