@@ -17,7 +17,10 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(SITE_DIR, 'data'
 const MEDIA_DIR = path.resolve(process.env.MEDIA_DIR || path.join(SITE_DIR, 'media'));
 const SEED_DIR = path.join(SITE_DIR, 'data');
 const PORT = Number(process.env.PORT || 8080);
-const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_MB || 64) * 1024 * 1024;
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 64);
+// A typo such as "64MB" would be NaN, and every size comparison against NaN is false.
+if (!Number.isFinite(MAX_UPLOAD_MB) || MAX_UPLOAD_MB <= 0) throw new Error('MAX_UPLOAD_MB must be a positive number of MiB, such as 64.');
+const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
 const publicUrl = new URL(process.env.PUBLIC_ORIGIN || 'http://localhost:8080');
 if (!['http:', 'https:'].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash) throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or a path.');
 const PUBLIC_ORIGIN = publicUrl.origin;
@@ -43,6 +46,12 @@ const MIME = {
   '.gif': 'image/gif', '.avif': 'image/avif', '.heic': 'image/heic', '.heif': 'image/heif', '.tiff': 'image/tiff', '.woff2': 'font/woff2',
   '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
 };
+// Every script, style, font, and image is served from this origin; previews of
+// photos and videos chosen in the composer use blob: URLs. The policy is a second
+// layer behind HTML escaping, and frame-ancestors stops other sites from framing
+// the management pages to trick a signed-in member into clicking Delete.
+const CONTENT_SECURITY_POLICY = ["default-src 'self'", "img-src 'self' blob:", "media-src 'self' blob:", "object-src 'none'",
+  "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'"].join('; ');
 const EXT = Object.fromEntries(Object.entries(MIME).filter(([, m]) => /^(image|video)\//.test(m)).map(([e, m]) => [m, e]));
 EXT['image/jpeg'] = '.jpg';
 // SVG remains available for bundled artwork, but uploaded media is passive.
@@ -62,7 +71,9 @@ function identity(req) {
 }
 async function ensureIdentity(req) {
   const forwarded = forwardedIdentity(req);
-  if (community.allowed(forwarded)) await withLock(async () => {
+  // Only a first (or interrupted) sign-in creates a profile. Every other request
+  // skips the write lock, so a long upload never stalls unrelated page loads.
+  if (community.allowed(forwarded) && community.needsProfile(forwarded, (await readProfiles()).profiles)) await withLock(async () => {
     const doc = await readProfiles(), profile = await community.ensure(forwarded, doc.profiles);
     if (!profile) return;
     const file = path.join(DATA_DIR, 'profiles.json'), tmp = `${file}.${process.pid}.tmp`;
@@ -152,26 +163,34 @@ async function updateProfile(req, res, who, id) {
   if (typeof name !== 'string' || !name.trim() || name.trim().length > 60 || typeof bio !== 'string' || bio.length > 1000) fail(400, 'Use a name up to 60 characters and a bio up to 1000 characters.');
   if (avatar && (typeof avatar !== 'object' || !avatar.type.startsWith('image/') || !EXT[avatar.type])) fail(415, 'Choose a supported photo for the profile.');
   if (avatar && removeAvatar) fail(400, 'Choose a new photo or remove the old one.');
-  const updated = await withLock(async () => {
-    const doc = await readProfiles(), previous = doc.profiles.find((profile) => profile.id === id);
+  const editableProfile = (doc) => {
+    const previous = doc.profiles.find((profile) => profile.id === id);
     if (!previous) fail(404, 'Profile not found.');
     requireEdit(who, previous, 'profile');
     checkVersion(req, previous);
-    const added = avatar?.size ? await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString()) : [];
-    const next = { ...previous, name: name.trim(), bio: bio.trim(), updatedAt: new Date().toISOString() };
-    if (added.length || removeAvatar) { next.avatar = added[0]?.src || null; next.avatarPreview = added[0]?.previewSrc || null; }
-    const history = path.join(DATA_DIR, '.profile-history');
-    try {
+    return previous;
+  };
+  // Check access before spending time on the photo, then process it outside the
+  // write lock. The checks run again under the lock in case the profile changed.
+  editableProfile(await readProfiles());
+  const added = avatar?.size ? await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString()) : [];
+  let updated;
+  try {
+    updated = await withLock(async () => {
+      const doc = await readProfiles(), previous = editableProfile(doc);
+      const next = { ...previous, name: name.trim(), bio: bio.trim(), updatedAt: new Date().toISOString() };
+      if (added.length || removeAvatar) { next.avatar = added[0]?.src || null; next.avatarPreview = added[0]?.previewSrc || null; }
+      const history = path.join(DATA_DIR, '.profile-history');
       await fsp.mkdir(history, { recursive: true, mode: 0o700 });
       await fsp.writeFile(path.join(history, `${Date.now()}-${crypto.randomUUID()}.json`), JSON.stringify({ profile: previous, actor: who.user, at: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
       const file = path.join(DATA_DIR, 'profiles.json'), tmp = `${file}.${process.pid}.tmp`;
       await fsp.writeFile(tmp, JSON.stringify({ ...doc, profiles: doc.profiles.map((profile) => profile.id === id ? next : profile) }, null, 2) + '\n');
       await fsp.rename(tmp, file);
       if (who.profileId === id) await community.finishSetup(who);
-    } catch (error) { await removeUnused(added); throw error; }
-    await removeUnused([{ src: previous.avatar, previewSrc: previous.avatarPreview }]);
-    return next;
-  });
+      await removeUnused([{ src: previous.avatar, previewSrc: previous.avatarPreview }]);
+      return next;
+    });
+  } catch (error) { await removeUnused(added); throw error; }
   return send(res, 200, editable(updated));
 }
 
@@ -228,7 +247,8 @@ async function readForm(req) {
   const milestone = field('milestone').trim() || null;
   if (text.length > 20000 || (milestone && milestone.length > 60)) fail(400, 'Post text or milestone is too long.');
   const date = field('publishedAt');
-  if (date && Number.isNaN(new Date(date).getTime())) fail(400, 'Choose a valid post date.');
+  // Post IDs and media folders come from the ISO date, which needs a four-digit year.
+  if (date && (Number.isNaN(new Date(date).getTime()) || !/^\d{4}-/.test(new Date(date).toISOString()))) fail(400, 'Choose a valid post date.');
   let meta, retained;
   try { meta = JSON.parse(field('mediaMeta') || '[]'); retained = form.has('retainMedia') ? JSON.parse(field('retainMedia')) : null; }
   catch { fail(400, 'Invalid media information.'); }
@@ -304,17 +324,21 @@ async function archivePost(post, who, action) {
 async function createPost(req, res, who) {
   const input = await readForm(req);
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
-  const post = await withLock(async () => {
-    who = identity(req);
-    if (!who) fail(401, 'Not signed in.');
-    const doc = await readPosts();
-    const publishedAt = input.publishedAt || new Date().toISOString();
-    const media = await storeMedia(input, publishedAt);
-    const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
-    try { await writePosts({ ...doc, posts: [...doc.posts, post] }); }
-    catch (err) { await removeUnused(media, doc); throw err; }
-    return post;
-  });
+  const publishedAt = input.publishedAt || new Date().toISOString();
+  // Photo processing can take minutes for a large post. New files stay private
+  // until the post that references them is written, so do it before locking.
+  const media = await storeMedia(input, publishedAt);
+  let post;
+  try {
+    post = await withLock(async () => {
+      who = identity(req);
+      if (!who) fail(401, 'Not signed in.');
+      const doc = await readPosts();
+      const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
+      await writePosts({ ...doc, posts: [...doc.posts, post] });
+      return post;
+    });
+  } catch (err) { await removeUnused(media); throw err; }
   return send(res, 201, editable(post));
 }
 
@@ -385,32 +409,41 @@ async function publishAgent(input, who, key, dryRun) {
   } finally { agentPublishing = false; }
 }
 
+// Locate the post and check access, version, and photo selection. updatePost runs
+// this before processing new photos and again under the write lock, so a post that
+// changed in the meantime is still refused with 412.
+function planUpdate(req, doc, who, id, input) {
+  const index = doc.posts.findIndex((p) => p.id === id);
+  if (index < 0) fail(404, 'This post no longer exists.');
+  const previous = doc.posts[index];
+  requireEdit(who, previous);
+  checkVersion(req, previous);
+  const retained = input.retained === null ? (previous.media || []) : input.retained.map((src) => {
+    const item = (previous.media || []).find((m) => m.src === src);
+    if (!item) fail(400, 'A selected photo no longer belongs to this post.');
+    return item;
+  });
+  if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
+  if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
+  return { index, previous, retained, publishedAt: input.publishedAt || previous.publishedAt };
+}
+
 async function updatePost(req, res, who, id) {
   const input = await readForm(req);
-  const post = await withLock(async () => {
-    const doc = await readPosts();
-    const index = doc.posts.findIndex((p) => p.id === id);
-    if (index < 0) fail(404, 'This post no longer exists.');
-    const previous = doc.posts[index];
-    requireEdit(who, previous);
-    checkVersion(req, previous);
-    const retained = input.retained === null ? (previous.media || []) : input.retained.map((src) => {
-      const item = (previous.media || []).find((m) => m.src === src);
-      if (!item) fail(400, 'A selected photo no longer belongs to this post.');
-      return item;
-    });
-    if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
-    if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
-    const publishedAt = input.publishedAt || previous.publishedAt;
-    const added = await storeMedia(input, publishedAt);
-    const updated = { ...previous, text: input.text, milestone: input.milestone, publishedAt, media: [...retained, ...added], updatedAt: new Date(Math.max(Date.now(), (Date.parse(previous.updatedAt) || 0) + 1)).toISOString() };
-    try {
+  const { publishedAt } = planUpdate(req, await readPosts(), who, id, input);
+  const added = await storeMedia(input, publishedAt);
+  let post;
+  try {
+    post = await withLock(async () => {
+      const doc = await readPosts();
+      const { index, previous, retained } = planUpdate(req, doc, who, id, input);
+      const updated = { ...previous, text: input.text, milestone: input.milestone, publishedAt, media: [...retained, ...added], updatedAt: new Date(Math.max(Date.now(), (Date.parse(previous.updatedAt) || 0) + 1)).toISOString() };
       await archivePost(previous, who, 'edit');
       await writePosts({ ...doc, posts: doc.posts.map((p, i) => i === index ? updated : p) });
-    } catch (err) { await removeUnused(added, doc); throw err; }
-    await removeUnused(previous.media || []);
-    return updated;
-  });
+      await removeUnused(previous.media || []);
+      return updated;
+    });
+  } catch (err) { await removeUnused(added); throw err; }
   return send(res, 200, editable(post));
 }
 
@@ -446,8 +479,11 @@ function listPosts(doc, url) {
 }
 
 /* ---------- static files ---------- */
+// The router has already decoded and normalized urlPath exactly once. Decoding it
+// again would let "%2563ompose" pass the private-page check as "%63ompose" and
+// then be served as "compose".
 function resolveStatic(urlPath) {
-  const clean = path.posix.normalize(decodeURIComponent(urlPath)).replace(/^\/+/, '');
+  const clean = urlPath.replace(/^\/+/, '');
   if (clean.split('/').some((s) => s.startsWith('.'))) return null;
   const [top, ...rest] = clean.split('/');
   if (top === 'data') return rest.length === 1 && ['posts.json', 'site.json', 'profiles.json'].includes(rest[0]) ? path.join(DATA_DIR, rest[0]) : null;
@@ -514,6 +550,8 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Robots-Tag', 'noindex, nofollow');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(self)');
+  res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+  res.setHeader('X-Frame-Options', 'DENY');
   const url = new URL(req.url.replace(/^\/+/, '/'), 'http://local');
   const { pathname } = url;
   try {

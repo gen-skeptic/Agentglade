@@ -89,6 +89,23 @@ test('community pages and all management operations require identity', async () 
   }
   assert.equal((await fetch(base + '/')).status, 200);
 });
+test('every response sends a self-only content security policy and refuses framing', async () => {
+  for (const route of ['/', '/login/', '/compose/', '/api/posts', '/data/posts.json', '/' + shared]) {
+    const response = await fetch(base + route);
+    const policy = response.headers.get('content-security-policy');
+    assert.match(policy, /(^|; )default-src 'self'(;|$)/); assert.match(policy, /(^|; )frame-ancestors 'none'(;|$)/);
+    assert.match(policy, /(^|; )object-src 'none'(;|$)/); assert.equal(response.headers.get('x-frame-options'), 'DENY');
+  }
+});
+test('static paths are percent-decoded exactly once', async () => {
+  // A single encoding is the same page and stays behind sign-in.
+  for (const route of ['/%63ompose/', '/%6Danage/']) assert.equal((await fetch(base + route)).status, 302);
+  // A double encoding is a literal "%63ompose" path, not a way around the sign-in check.
+  for (const route of ['/%2563ompose/', '/%2577elcome/', '/%256Danage/index.html']) assert.equal((await fetch(base + route)).status, 404);
+  // A "%" left after the one decode is an ordinary missing file, not a server error.
+  for (const route of ['/%25zz', '/assets/%25']) assert.equal((await fetch(base + route)).status, 404);
+  assert.equal((await fetch(base + '/%zz')).status, 400);
+});
 test('only listed Authentik identities can open private pages or use APIs', async () => {
   for (const user of ['local-owner@example.test', 'unlisted-authentik-user', 'toString', '__proto__']) {
     const headers = { 'Remote-User': user, 'Remote-Name': 'authentik Default Admin', 'Remote-Email': 'admin@example.test', 'Remote-Role': 'Admin' };
@@ -237,11 +254,26 @@ test('a broken photo leaves the post unchanged and rolls back newly generated pr
 test('invalid metadata and foreign retained paths leave published data unchanged', async () => {
   const post = await read();
   for (const body of [form({ meta: null }), form({ retained: ['media/2026/11/other.png'] }),
-    form({ text: '', retained: [] }), form({ publishedAt: 'not-a-date' })]) {
+    form({ text: '', retained: [] }), form({ publishedAt: 'not-a-date' }), form({ publishedAt: '+010000-01-01T00:00:00Z' })]) {
     assert.equal((await call('/api/posts/first', { method: 'PUT', version: post.version, body })).status, 400);
   }
   assert.equal((await read()).version, post.version);
   assert.equal((await call('/api/posts', { method: 'POST', body: form({ files: [{ type: 'image/svg+xml' }] }) })).status, 415);
+  // Years outside 0000–9999 cannot name a media folder; refuse them before storing anything.
+  for (const publishedAt of ['+010000-01-01T00:00:00Z', '-000001-01-01T00:00:00Z']) {
+    assert.equal((await call('/api/posts', { method: 'POST', body: form({ publishedAt, files: [{}] }) })).status, 400);
+  }
+  assert.deepEqual(await fs.readdir(path.join(directory, 'media')), ['2026']);
+  assert.equal((await call('/api/posts')).body.total, 2);
+});
+test('an unparseable upload limit stops startup instead of disabling the limit', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-limit-tests-'));
+  try {
+    for (const value of ['64MB', '0', '-1']) {
+      // Stop a server that wrongly starts, so a regression fails instead of hanging.
+      await assert.rejects(startServer(root, { MAX_UPLOAD_MB: value }).then(({ child: started }) => stopServer(started)), /MAX_UPLOAD_MB must be a positive number/);
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 test('stable pagination continues even when the cursor post is deleted', async () => {
   const page = await call('/api/posts?limit=1');

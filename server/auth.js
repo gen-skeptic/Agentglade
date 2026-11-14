@@ -70,6 +70,7 @@ export async function createHumanAuth({ configFile, origin }) {
       }
       let body;
       try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { reply(res, 400, { error: 'Invalid login request.' }); return true; }
+      if (!body || typeof body !== 'object') { reply(res, 400, { error: 'Invalid login request.' }); return true; }
       if (!admin || body.username !== admin.username || typeof body.password !== 'string' || body.password.length > 256 || !await verifyPassword(body.password, admin.passwordHash)) {
         reply(res, 401, { error: 'Invalid username or password.' }); return true;
       }

@@ -144,6 +144,24 @@ test('a committed binding repairs interrupted profile creation and private mappi
   for (const route of ['/data/.member-profiles.json', '/.member-profiles.json']) assert.equal((await call(route, { user: null })).status, 404);
   for (const profile of await profiles()) assert.equal('subject' in profile || 'email' in profile, false);
 });
+test('accounts configured after the first start get their configured profile without moving existing bindings', async () => {
+  const later = '5'.repeat(64), unsigned = '6'.repeat(64), conflicting = '7'.repeat(64);
+  const base = { [admin]: { name: 'Admin', profileId: 'admin' }, [editor]: { name: 'Editor', profileId: 'editor' } };
+  await stop(); await start({ MEMBER_ACCOUNTS: JSON.stringify({ ...base, [unsigned]: {} }) });
+  await stop(); await start({ MEMBER_ACCOUNTS: JSON.stringify({ ...base, [unsigned]: { profileId: 'orbit' }, [later]: { name: 'Nova', profileId: 'nova' }, [conflicting]: { profileId: 'editor' } }) });
+  const added = (await call('/api/me', { user: later })).body;
+  assert.equal(added.profileId, 'nova'); assert.equal(added.name, 'Nova'); assert.equal(added.needsSetup, false);
+  // Listed on an earlier start but never signed in, so nothing was bound yet.
+  assert.equal((await call('/api/me', { user: unsigned })).body.profileId, 'orbit');
+  // A profile that already belongs to someone is never reassigned.
+  const refused = (await call('/api/me', { user: conflicting })).body;
+  assert.match(refused.profileId, /^member-[a-f0-9]{40}$/); assert.equal(refused.needsSetup, true);
+  assert.equal((await call('/api/me', { user: editor })).body.profileId, 'editor');
+  // A restart with the same configuration changes nothing further.
+  const ledger = await fs.readFile(path.join(root, 'data/.member-profiles.json'), 'utf8');
+  await stop(); await start({ MEMBER_ACCOUNTS: JSON.stringify({ ...base, [unsigned]: { profileId: 'orbit' }, [later]: { name: 'Nova', profileId: 'nova' }, [conflicting]: { profileId: 'editor' } }) });
+  assert.equal(await fs.readFile(path.join(root, 'data/.member-profiles.json'), 'utf8'), ledger);
+});
 test('malformed binding data fails closed rather than guessing by name or email', async () => {
   await stop(); await fs.writeFile(path.join(root, 'data/.member-profiles.json'), '{"schema":1,"accounts":[{"name":"Admin"}]}');
   await assert.rejects(start(), /Invalid community profile ledger/);

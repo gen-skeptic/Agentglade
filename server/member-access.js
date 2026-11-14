@@ -36,16 +36,40 @@ export function createMemberAccess({ directory, accounts, owners = [], requiredR
     return Object.hasOwn(accounts || {}, who.user);
   }
   const account = (subject) => doc?.accounts.find((a) => a.subject === subject);
+  // True when this member's bound public profile is missing and ensure() must create it.
+  const needsProfile = (who, profiles) => {
+    const profileId = account(who.user)?.profileId;
+    return !profileId || !profiles.some((p) => p.id === profileId);
+  };
+  const configured = (subject, config) => ({ subject, name: config.name || '', profileId: config.profileId || null, onboarded: !!config.profileId });
   return {
     async initialize() {
       try { doc = JSON.parse(await fs.readFile(file, 'utf8')); validate(doc); }
       catch (error) {
         if (error.code !== 'ENOENT') throw error;
-        await write({ schema: 1, accounts: Object.entries(accounts || {}).map(([subject, config]) => ({ subject,
-          name: config.name || '', profileId: config.profileId || null, onboarded: !!config.profileId })) });
+        await write({ schema: 1, accounts: Object.entries(accounts || {}).map(([subject, config]) => configured(subject, config)) });
+        return;
       }
+      // An account added to MEMBER_ACCOUNTS after the first start gets the same
+      // binding a fresh install would give it. Bound accounts never move, and a
+      // profile already bound to another account is never reassigned.
+      let next = doc.accounts;
+      for (const [subject, config] of Object.entries(accounts || {})) {
+        const current = next.find((a) => a.subject === subject);
+        if (current?.profileId) continue;
+        const wanted = configured(subject, config);
+        if (wanted.profileId && next.some((a) => a.profileId === wanted.profileId)) {
+          console.warn(`MEMBER_ACCOUNTS binds profile "${wanted.profileId}", which is already bound to another account. That account keeps its own profile.`);
+          Object.assign(wanted, { profileId: null, onboarded: false });
+        }
+        if (!current) next = [...next, wanted];
+        else if (wanted.profileId || (!current.name && wanted.name)) {
+          next = next.map((a) => a === current ? { ...current, name: current.name || wanted.name, profileId: wanted.profileId, onboarded: current.onboarded || wanted.onboarded } : a);
+        }
+      }
+      if (next !== doc.accounts) await write({ ...doc, accounts: next });
     },
-    account, allowed,
+    account, allowed, needsProfile,
     session(who) {
       if (!allowed(who)) return null;
       const mapping = account(who.user);
@@ -57,8 +81,8 @@ export function createMemberAccess({ directory, accounts, owners = [], requiredR
     // the next request repairs that exact profile instead of creating a duplicate.
     async ensure(who, profiles) {
       if (!allowed(who)) return null;
+      if (!needsProfile(who, profiles)) return null;
       let mapping = account(who.user);
-      if (mapping?.profileId && profiles.some((p) => p.id === mapping.profileId)) return null;
       if (!mapping && doc.accounts.length >= 250) throw Object.assign(new Error('Community profile limit reached.'), { status: 503 });
       const name = mapping?.name || String(who.displayName || '').trim().slice(0, 60) || 'Community member';
       let id = mapping?.profileId;

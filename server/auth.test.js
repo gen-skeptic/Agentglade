@@ -24,6 +24,7 @@ after(async () => { if (child && child.exitCode === null) { const exited = once(
 const login = (body, extra = {}) => fetch(base + '/api/auth/login', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json', ...extra }, body: JSON.stringify(body) });
 test('local login issues a secure cookie, permits administration, and logout revokes it', async () => {
   assert.equal((await login({ username: 'operator', password: 'incorrect' })).status, 401);
+  for (const body of [null, 7, 'operator']) assert.equal((await login(body)).status, 400);
   assert.equal((await login({ username: 'operator', password }, { Origin: 'https://evil.example' })).status, 403);
   const response = await login({ username: 'operator', password }); assert.equal(response.status, 200);
   const cookie = response.headers.get('set-cookie'); assert.match(cookie, /HttpOnly; SameSite=Strict/); assert.match(cookie, /; Secure/);
