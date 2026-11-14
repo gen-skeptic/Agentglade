@@ -14,6 +14,9 @@ while it is stopped. An installation from before this layout keeps its posts in
 the original as `/data/posts.json.migrated`, which you can delete once you have
 checked the result.
 
+Loves are kept in the private `/data/.loves.jsonl`, which stores only hashes of
+member accounts and browser IDs and is compacted at startup.
+
 Uploaded videos wait in the private `/data/.video-jobs/` until they are converted
 in the background, one at a time, and resume after a restart. Videos published by
 releases before conversion existed are converted at the next start; each original

@@ -12,6 +12,7 @@ import { createHumanAuth } from './auth.js';
 import { createMemberAccess } from './member-access.js';
 import { openPostStore } from './post-store.js';
 import { createVideoProcessor, sniffVideo } from './videos.js';
+import { openLoveStore, memberKey, visitorKey } from './loves.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = path.resolve(process.env.SITE_DIR || path.join(HERE, '..'));
@@ -147,7 +148,7 @@ function withLock(fn) {
 }
 
 // Opened at startup, before the server listens.
-let posts, videos;
+let posts, videos, loves;
 const newPostId = (publishedAt) => {
   let id;
   do id = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`; while (posts.has(id));
@@ -551,6 +552,7 @@ async function deletePost(req, res, who, id) {
     checkVersion(req, previous);
     await archivePost(previous, who, 'delete');
     await posts.remove(id);
+    await loves.forget(id);
     await removeUnused(previous.media || []);
   });
   return send(res, 204, '');
@@ -602,13 +604,56 @@ function feedSummary(profile) {
   }
   return summaryCache.byProfile.get(key);
 }
-function handleFeed(req, res, pathname, url) {
+// Who is loving: a signed-in member (password session or identity proxy), or else this
+// browser's random visitor ID, which a member's browser links to their account.
+function loverKey(req) {
+  const who = identity(req);
+  return who ? memberKey(who.user) : visitorKey(req.headers['x-agentglade-visitor']);
+}
+const withLoves = (view, key) => (post) => ({ ...view(post), loves: loves.count(post.id), loved: loves.has(post.id, key) });
+const loveRates = new Map();
+function limitLoves(req) {
+  const now = Date.now(), address = humanAuth.clientAddress(req);
+  for (const [client, rate] of loveRates) if (now - rate.started >= 60000) loveRates.delete(client);
+  const rate = loveRates.get(address) || { started: now, count: 0 };
+  loveRates.set(address, rate);
+  if (++rate.count > 30 || loveRates.size > 50000) fail(429, 'Too many loves at once. Try again in a minute.');
+}
+async function handleLoves(req, res, pathname) {
+  const match = /^\/api\/feed\/posts\/([^/]+)\/love$/.exec(pathname);
+  if (pathname !== '/api/feed/loves/import' && !match) return false;
+  const key = loverKey(req);
+  if (pathname === '/api/feed/loves/import') {
+    // Loves saved only in this browser by earlier releases move to the server once.
+    if (req.method !== 'POST') return send(res, 405, { error: 'Use POST.' }, { Allow: 'POST' }), true;
+    const body = await readJSON(req);
+    if (!key) fail(400, 'Missing visitor ID.');
+    if (!Array.isArray(body?.ids) || body.ids.length > 300 || body.ids.some((id) => typeof id !== 'string')) fail(400, 'Send up to 300 post IDs.');
+    limitLoves(req);
+    if (loves.lovedBy(key) > 0) fail(409, 'This browser already keeps its loves on the server.');
+    const ids = [...new Set(body.ids)].filter((id) => posts.has(id));
+    for (const id of ids) await loves.set(id, key, true);
+    return send(res, 200, { imported: ids.length }), true;
+  }
+  if (req.method !== 'PUT' && req.method !== 'DELETE') return send(res, 405, { error: 'Use PUT or DELETE.' }, { Allow: 'PUT, DELETE' }), true;
+  if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
+  let id;
+  try { id = decodeURIComponent(match[1]); } catch { fail(400, 'Invalid post.'); }
+  if (!posts.has(id)) fail(404, 'This post no longer exists.');
+  if (!key) fail(400, 'Missing visitor ID.');
+  limitLoves(req);
+  await loves.set(id, key, req.method === 'PUT');
+  return send(res, 200, { loves: loves.count(id), loved: loves.has(id, key) }), true;
+}
+async function handleFeed(req, res, pathname, url) {
   if (pathname !== '/api/feed' && !pathname.startsWith('/api/feed/')) return false;
+  if (await handleLoves(req, res, pathname)) return true;
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Use GET.' }, { Allow: 'GET, HEAD' }), true;
+  const view = withLoves(publicView, loverKey(req));
   if (pathname === '/api/feed') {
     const { filter, profile } = feedSelection(url);
     const keep = FEED_FILTERS[filter], mine = ofProfile(profile);
-    return send(res, 200, listPosts(posts.all().filter((post) => keep(post) && mine(post)), url, publicView)), true;
+    return send(res, 200, listPosts(posts.all().filter((post) => keep(post) && mine(post)), url, view)), true;
   }
   if (pathname === '/api/feed/summary') return send(res, 200, feedSummary(feedSelection(url).profile)), true;
   const match = /^\/api\/feed\/posts\/([^/]+)$/.exec(pathname);
@@ -617,7 +662,7 @@ function handleFeed(req, res, pathname, url) {
   try { id = decodeURIComponent(match[1]); } catch { fail(400, 'Invalid post.'); }
   const post = posts.get(id);
   if (!post) fail(404, 'This post no longer exists.');
-  return send(res, 200, publicView(post)), true;
+  return send(res, 200, view(post)), true;
 }
 
 /* ---------- static files ---------- */
@@ -697,7 +742,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/healthz') return send(res, 200, 'ok');
     if (await humanAuth.handle(req, res, pathname)) return;
     if (await handleAgent(req, res, pathname, url.search)) return;
-    if (handleFeed(req, res, pathname, url)) return;
+    if (await handleFeed(req, res, pathname, url)) return;
     if (pathname.startsWith('/api/')) {
       const who = await ensureIdentity(req);
       if (!who) return send(res, 401, { error: 'Not signed in.' });
@@ -706,6 +751,12 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ...who, name: author.author, profileId: author.profileId || null });
       }
       if (pathname === '/api/profiles' && req.method === 'GET') return send(res, 200, { profiles: (await readProfiles()).profiles.map(editable) });
+      if (pathname === '/api/me/visitor' && req.method === 'POST') {
+        const visitor = visitorKey((await readJSON(req))?.token);
+        if (!visitor) fail(400, 'Invalid visitor ID.');
+        await loves.link(visitor, memberKey(who.user));
+        return send(res, 204, '');
+      }
       if (pathname === '/api/me/setup' && req.method === 'POST') {
         await readJSON(req);
         await withLock(() => community.finishSetup(who));
@@ -713,7 +764,7 @@ const server = http.createServer(async (req, res) => {
       }
       const profileMatch = /^\/api\/profiles\/([a-z][a-z0-9-]{0,47})$/.exec(pathname);
       if (profileMatch && req.method === 'PUT') return await updateProfile(req, res, who, profileMatch[1]);
-      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(posts.all(), url, (post) => postView(post, who)));
+      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(posts.all(), url, withLoves((post) => postView(post, who), memberKey(who.user))));
       if (pathname === '/api/posts' && req.method === 'POST') return await createPost(req, res, who);
       const match = /^\/api\/posts\/([^/]+)$/.exec(pathname);
       if (match) {
@@ -751,6 +802,8 @@ await seed();
 posts = await openPostStore(DATA_DIR);
 await community.initialize();
 await migrateProfiles();
+loves = await openLoveStore(DATA_DIR);
+await loves.compact((id) => posts.has(id));
 videos = await createVideoProcessor({ dataDir: DATA_DIR, mediaPath: uploadedPath, complete: finishVideo });
 await resumeVideos();
 server.listen(PORT, () => console.log(`agentglade listening on :${server.address().port} (data ${DATA_DIR}, media ${MEDIA_DIR})`));

@@ -3,8 +3,22 @@ export const SITE_ROOT = new URL('../../', import.meta.url);
 
 export const resolve = (path) => (/^(blob:|data:|https?:)/.test(path) ? path : new URL(path, SITE_ROOT).href);
 
+// A random ID for this browser, so a reader's loves count once and stay theirs.
+// A member's browser is linked to their account when they open a community page.
+const VISITOR = 'agentglade.visitor';
+let sessionVisitor;
+export function visitorId() {
+  const fresh = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  try {
+    let id = localStorage.getItem(VISITOR);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(id || '')) { id = fresh(); localStorage.setItem(VISITOR, id); }
+    return id;
+  } catch { return (sessionVisitor ||= fresh()); }
+}
+const visitorHeaders = () => ({ 'X-Agentglade-Visitor': visitorId() });
+
 async function getJSON(path) {
-  const res = await fetch(resolve(path), { cache: 'no-cache' });
+  const res = await fetch(resolve(path), { cache: 'no-cache', ...(path.startsWith('api/feed') ? { headers: visitorHeaders() } : {}) });
   if (!res.ok) throw new Error(`${path}: ${res.status}`);
   return res.json();
 }
@@ -20,6 +34,15 @@ export const loadFeedPage = ({ before = null, filter = 'all', profile = null } =
   getJSON(`api/feed?${query({ before, filter: filter === 'all' ? null : filter, profile })}`);
 export const loadFeedSummary = (profile = null) => getJSON(`api/feed/summary?${query({ profile })}`);
 export const loadFeedPost = (id) => getJSON(`api/feed/posts/${encodeURIComponent(id)}`);
+export async function setLove(id, loved) {
+  const res = await fetch(resolve(`api/feed/posts/${encodeURIComponent(id)}/love`), { method: loved ? 'PUT' : 'DELETE', headers: visitorHeaders(), credentials: 'same-origin' });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Love failed: ${res.status}`);
+  return res.json();
+}
+export const importLoves = (ids) => fetch(resolve('api/feed/loves/import'), { method: 'POST', credentials: 'same-origin',
+  headers: { ...visitorHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
+export const linkVisitor = () => fetch(resolve('api/me/visitor'), { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+  headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: visitorId() }) });
 
 // Multipart mutations use the current human session and server-bound author.
 async function communityRequest(path, options = {}) {

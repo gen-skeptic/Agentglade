@@ -63,6 +63,9 @@ function mediaHtml(post, interactive = true) {
   return `<div class="${cls}">${cells}</div>`;
 }
 
+export const loveCount = (n) => n ? `<span class="love-count" aria-hidden="true">${n}</span>` : '';
+export const loveLabel = (n) => n ? `Love (${n} ${n === 1 ? 'love' : 'loves'})` : 'Love';
+
 export function renderPost(post, { born = null, preview = false } = {}) {
   const profile = profileForPost(post);
   if (profile) post = { ...post, author: profile.name, initials: profile.name.split(/\s+/).map((word) => word[0]).join('').slice(0, 2), avatar: profile.avatarPreview || profile.avatar };
@@ -71,7 +74,7 @@ export function renderPost(post, { born = null, preview = false } = {}) {
   const permalink = `#${encodeURIComponent(post.id)}`;
   const actions = preview ? '' : `
     <div class="post-actions">
-      <button type="button" class="post-action" data-love="${esc(post.id)}" aria-pressed="false">${icon('heart')}<span>Love</span></button>
+      <button type="button" class="post-action" data-love="${esc(post.id)}" aria-pressed="${post.loved ? 'true' : 'false'}" aria-label="${loveLabel(post.loves)}">${icon('heart')}<span>Love</span>${loveCount(post.loves)}</button>
       <button type="button" class="post-action" data-copy="${esc(post.id)}">${icon('link')}<span>Copy link</span></button>
     </div>`;
   return `

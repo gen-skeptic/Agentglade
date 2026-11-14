@@ -1,10 +1,10 @@
 import { hydrateIcons } from './icons.js?v=8';
-import { loadSite, loadFeedPage, loadFeedSummary, loadFeedPost, loadProfiles, resolve } from './data.js?v=8';
+import { loadSite, loadFeedPage, loadFeedSummary, loadFeedPost, loadProfiles, setLove, importLoves, resolve } from './data.js?v=8';
 import { setProfileDirectory } from './profile-directory.js?v=8';
-import { renderPost, formatAge, esc } from './render.js?v=8';
+import { renderPost, loveCount, loveLabel, formatAge, esc } from './render.js?v=8';
 
 const $ = (s, r = document) => r.querySelector(s);
-const LOVES = 'agentglade.loves';
+const LEGACY_LOVES = 'agentglade.loves';
 const FILTERS = ['all', 'photos', 'milestones'];
 
 let site = {};
@@ -76,7 +76,6 @@ async function loadPage(reset = false) {
     }
     feed.next = page.nextCursor;
     if (reset && !page.posts.length) el.innerHTML = `<p class="feed-status">No ${feed.filter === 'all' ? 'posts' : feed.filter} yet.</p>`;
-    restoreLoves();
   } catch (err) {
     console.error(err);
     if (reset) $('#posts').innerHTML = '<p class="feed-status is-error">Couldn\'t load posts. Refresh to try again.</p>';
@@ -95,16 +94,39 @@ async function showLinked(id) {
     known.set(post.id, post);
     $('#posts').insertAdjacentHTML('beforebegin', `<section class="feed-linked" id="feed-linked" aria-label="Linked post"><p class="feed-linked-note"><span>Linked post</span><a href="#all">Show all posts</a></p>${renderPost(post, { born: site.born })}</section>`);
     element = document.getElementById(id);
-    restoreLoves();
   }
   element?.scrollIntoView();
 }
 
-/* ---- Love (saved on this device only until there's a backend) ---- */
-function getLoves() { try { return new Set(JSON.parse(localStorage.getItem(LOVES)) || []); } catch { return new Set(); } }
-function restoreLoves() {
-  const loves = getLoves();
-  document.querySelectorAll('[data-love]').forEach((b) => b.setAttribute('aria-pressed', String(loves.has(b.dataset.love))));
+/* ---- Love: saved on the server, shown on every copy of the post on the page ---- */
+function showLove(id, loved, loves) {
+  const post = known.get(id);
+  if (post) Object.assign(post, { loved, loves });
+  document.querySelectorAll('[data-love]').forEach((button) => {
+    if (button.dataset.love !== id) return;
+    button.setAttribute('aria-pressed', String(loved));
+    button.setAttribute('aria-label', loveLabel(loves));
+    button.querySelector('.love-count')?.remove();
+    button.insertAdjacentHTML('beforeend', loveCount(loves));
+  });
+}
+async function toggleLove(id) {
+  const post = known.get(id);
+  if (!post) return;
+  const before = { loved: !!post.loved, loves: post.loves || 0 };
+  showLove(id, !before.loved, Math.max(0, before.loves + (before.loved ? -1 : 1)));
+  try { const saved = await setLove(id, !before.loved); showLove(id, saved.loved, saved.loves); }
+  catch (error) { console.warn(error.message); showLove(id, before.loved, before.loves); }
+}
+// Earlier releases kept loves only in this browser; send them to the server once.
+async function moveLocalLoves() {
+  let ids;
+  try { ids = JSON.parse(localStorage.getItem(LEGACY_LOVES)); } catch { return; }
+  if (!Array.isArray(ids)) return;
+  try {
+    const res = await importLoves(ids.slice(0, 300));
+    if (res.ok || res.status === 409 || res.status === 400) localStorage.removeItem(LEGACY_LOVES);
+  } catch { /* Offline: try again on the next visit. */ }
 }
 
 /* ---- Lightbox ---- */
@@ -136,12 +158,7 @@ document.addEventListener('click', async (e) => {
   if (e.target.closest('[data-more]')) return loadPage();
 
   const love = e.target.closest('[data-love]');
-  if (love) {
-    const loves = getLoves();
-    loves.has(love.dataset.love) ? loves.delete(love.dataset.love) : loves.add(love.dataset.love);
-    try { localStorage.setItem(LOVES, JSON.stringify([...loves])); } catch {}
-    return restoreLoves();
-  }
+  if (love) return toggleLove(love.dataset.love);
 
   const copy = e.target.closest('[data-copy]');
   if (copy) {
@@ -191,6 +208,7 @@ async function init() {
   } catch (err) {
     console.error(err);
   }
+  await moveLocalLoves();
   await loadPage(true);
   const id = linkedId();
   if (id) await showLinked(id);
