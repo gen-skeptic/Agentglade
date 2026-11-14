@@ -446,8 +446,11 @@ function listPosts(doc, url) {
 }
 
 /* ---------- static files ---------- */
+// The router has already decoded and normalized urlPath exactly once. Decoding it
+// again would let "%2563ompose" pass the private-page check as "%63ompose" and
+// then be served as "compose".
 function resolveStatic(urlPath) {
-  const clean = path.posix.normalize(decodeURIComponent(urlPath)).replace(/^\/+/, '');
+  const clean = urlPath.replace(/^\/+/, '');
   if (clean.split('/').some((s) => s.startsWith('.'))) return null;
   const [top, ...rest] = clean.split('/');
   if (top === 'data') return rest.length === 1 && ['posts.json', 'site.json', 'profiles.json'].includes(rest[0]) ? path.join(DATA_DIR, rest[0]) : null;

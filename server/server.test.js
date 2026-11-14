@@ -89,6 +89,15 @@ test('community pages and all management operations require identity', async () 
   }
   assert.equal((await fetch(base + '/')).status, 200);
 });
+test('static paths are percent-decoded exactly once', async () => {
+  // A single encoding is the same page and stays behind sign-in.
+  for (const route of ['/%63ompose/', '/%6Danage/']) assert.equal((await fetch(base + route)).status, 302);
+  // A double encoding is a literal "%63ompose" path, not a way around the sign-in check.
+  for (const route of ['/%2563ompose/', '/%2577elcome/', '/%256Danage/index.html']) assert.equal((await fetch(base + route)).status, 404);
+  // A "%" left after the one decode is an ordinary missing file, not a server error.
+  for (const route of ['/%25zz', '/assets/%25']) assert.equal((await fetch(base + route)).status, 404);
+  assert.equal((await fetch(base + '/%zz')).status, 400);
+});
 test('only listed Authentik identities can open private pages or use APIs', async () => {
   for (const user of ['local-owner@example.test', 'unlisted-authentik-user', 'toString', '__proto__']) {
     const headers = { 'Remote-User': user, 'Remote-Name': 'authentik Default Admin', 'Remote-Email': 'admin@example.test', 'Remote-Role': 'Admin' };
