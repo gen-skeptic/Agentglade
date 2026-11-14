@@ -316,6 +316,30 @@ test('an unparseable upload limit stops startup instead of disabling the limit',
     }
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+test('the public feed pages through posts with filters, a summary, and permalinks, without account subjects', async () => {
+  const milestone = (await call('/api/posts', { method: 'POST', body: form({ text: 'A milestone', milestone: 'First steps', publishedAt: '2026-11-13T12:00:00.000Z' }) })).body;
+  const admin = (await call('/api/posts', { method: 'POST', headers: { 'Remote-User': 'admin-account' }, body: form({ text: 'Admin note', publishedAt: '2026-11-14T12:00:00.000Z' }) })).body;
+  const anonymous = async (route, options) => { const response = await globalThis.fetch(base + route, options); return { status: response.status, body: await response.json().catch(() => null) }; };
+  const ids = (page) => page.body.posts.map((post) => post.id);
+  const first = await anonymous('/api/feed?limit=2');
+  assert.equal(first.status, 200); assert.deepEqual(ids(first), [admin.id, milestone.id]); assert.equal(first.body.total, 4);
+  const second = await anonymous('/api/feed?limit=2&before=' + encodeURIComponent(first.body.nextCursor));
+  assert.deepEqual(ids(second), ['second', 'first']); assert.equal(second.body.nextCursor, null);
+  assert.deepEqual(ids(await anonymous('/api/feed?filter=photos')), ['second', 'first']);
+  assert.deepEqual(ids(await anonymous('/api/feed?filter=milestones')), [milestone.id]);
+  assert.deepEqual(ids(await anonymous('/api/feed?profile=' + admin.profileId)), [admin.id]);
+  const summary = (await anonymous('/api/feed/summary')).body;
+  assert.deepEqual(summary.counts, { all: 4, photos: 2, milestones: 1 });
+  assert.deepEqual(summary.recentPhotos.map((photo) => [photo.postId, photo.index, photo.src]), [['second', 0, shared], ['first', 0, shared]]);
+  assert.deepEqual(summary.milestones, [{ postId: milestone.id, milestone: 'First steps', publishedAt: '2026-11-13T12:00:00.000Z' }]);
+  assert.deepEqual((await anonymous('/api/feed/summary?profile=' + admin.profileId)).body.counts, { all: 1, photos: 0, milestones: 0 });
+  const single = await anonymous('/api/feed/posts/first');
+  assert.equal(single.status, 200); assert.equal(single.body.text, 'Original first');
+  for (const body of [first.body, second.body, single.body, summary]) assert.equal(JSON.stringify(body).includes('parent-a') || JSON.stringify(body).includes('admin-account'), false);
+  assert.equal((await anonymous('/api/feed/posts/missing')).status, 404);
+  for (const route of ['/api/feed?filter=secret', '/api/feed?profile=../x', '/api/feed?before=nonsense']) assert.equal((await anonymous(route)).status, 400);
+  assert.equal((await anonymous('/api/feed', { method: 'POST' })).status, 405);
+});
 test('stable pagination continues even when the cursor post is deleted', async () => {
   const page = await call('/api/posts?limit=1');
   assert.equal(page.body.posts[0].id, 'second');

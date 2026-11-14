@@ -504,6 +504,55 @@ function listPosts(sorted, url, view) {
   return { posts: page.map(view), total: sorted.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
 }
 
+/* ---------- public feed ---------- */
+// Readers page through the feed instead of downloading every post. These routes
+// are public and show only what /data/posts.json always has.
+const FEED_FILTERS = { all: () => true, photos: (post) => (post.media || []).length > 0, milestones: (post) => !!post.milestone };
+function feedSelection(url) {
+  const filter = url.searchParams.get('filter') || 'all', profile = url.searchParams.get('profile');
+  if (!Object.hasOwn(FEED_FILTERS, filter)) fail(400, 'Unknown feed filter.');
+  if (profile !== null && !/^[a-z][a-z0-9-]{0,47}$/.test(profile)) fail(400, 'Unknown profile.');
+  return { filter, profile };
+}
+const ofProfile = (profile) => (post) => !profile || post.profileId === profile;
+let summaryCache = { generation: -1, byProfile: new Map() };
+function feedSummary(profile) {
+  if (summaryCache.generation !== posts.generation) summaryCache = { generation: posts.generation, byProfile: new Map() };
+  const key = profile || '';
+  if (!summaryCache.byProfile.has(key)) {
+    const shown = posts.all().filter(ofProfile(profile));
+    const counts = Object.fromEntries(Object.entries(FEED_FILTERS).map(([name, keep]) => [name, shown.filter(keep).length]));
+    const recentPhotos = [];
+    for (const post of shown) {
+      for (const [index, media] of (post.media || []).entries()) {
+        if (media.type === 'image' && recentPhotos.length < 9) recentPhotos.push({ postId: post.id, index, src: media.src, previewSrc: media.previewSrc, alt: media.alt || '' });
+      }
+      if (recentPhotos.length >= 9) break;
+    }
+    const milestones = shown.filter(FEED_FILTERS.milestones).slice(0, 20).map((post) => ({ postId: post.id, milestone: post.milestone, publishedAt: post.publishedAt }));
+    if (summaryCache.byProfile.size > 200) summaryCache.byProfile.clear();
+    summaryCache.byProfile.set(key, { counts, recentPhotos, milestones });
+  }
+  return summaryCache.byProfile.get(key);
+}
+function handleFeed(req, res, pathname, url) {
+  if (pathname !== '/api/feed' && !pathname.startsWith('/api/feed/')) return false;
+  if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Use GET.' }, { Allow: 'GET, HEAD' }), true;
+  if (pathname === '/api/feed') {
+    const { filter, profile } = feedSelection(url);
+    const keep = FEED_FILTERS[filter], mine = ofProfile(profile);
+    return send(res, 200, listPosts(posts.all().filter((post) => keep(post) && mine(post)), url, publicView)), true;
+  }
+  if (pathname === '/api/feed/summary') return send(res, 200, feedSummary(feedSelection(url).profile)), true;
+  const match = /^\/api\/feed\/posts\/([^/]+)$/.exec(pathname);
+  if (!match) return send(res, 404, { error: 'Not found.' }), true;
+  let id;
+  try { id = decodeURIComponent(match[1]); } catch { fail(400, 'Invalid post.'); }
+  const post = posts.get(id);
+  if (!post) fail(404, 'This post no longer exists.');
+  return send(res, 200, publicView(post)), true;
+}
+
 /* ---------- static files ---------- */
 // The router has already decoded and normalized urlPath exactly once. Decoding it
 // again would let "%2563ompose" pass the private-page check as "%63ompose" and
@@ -581,6 +630,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/healthz') return send(res, 200, 'ok');
     if (await humanAuth.handle(req, res, pathname)) return;
     if (await handleAgent(req, res, pathname, url.search)) return;
+    if (handleFeed(req, res, pathname, url)) return;
     if (pathname.startsWith('/api/')) {
       const who = await ensureIdentity(req);
       if (!who) return send(res, 401, { error: 'Not signed in.' });

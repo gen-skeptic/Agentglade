@@ -145,6 +145,9 @@ img, video { display: block; max-width: 100%; }
 .feed-end::before, .feed-end::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
 .feed-status { padding: 2rem 1rem; text-align: center; color: var(--muted); font-family: var(--font-mono); font-size: .8rem; }
 .feed-status.is-error { color: var(--danger); }
+.feed-more { display: flex; justify-content: center; padding: 1rem 0; }
+.feed-linked { margin-bottom: 1rem; }
+.feed-linked-note { display: flex; justify-content: space-between; gap: 1rem; margin: 0 0 .5rem; color: var(--muted); font-family: var(--font-mono); font-size: .72rem; }
 
 /* Skeleton while loading */
 .skeleton { height: 420px; background-color: var(--surface); background-image: radial-gradient(circle, var(--rule-soft) 1px, transparent 1px); background-size: 18px 18px; border: var(--stroke-hairline) solid var(--rule); border-radius: var(--radius-sm); }

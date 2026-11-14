@@ -1,26 +1,24 @@
 import { hydrateIcons } from './icons.js?v=8';
-import { loadSite, loadPosts, loadProfiles, resolve } from './data.js?v=8';
-import { setProfileDirectory, postProfileId } from './profile-directory.js?v=8';
+import { loadSite, loadFeedPage, loadFeedSummary, loadFeedPost, loadProfiles, resolve } from './data.js?v=8';
+import { setProfileDirectory } from './profile-directory.js?v=8';
 import { renderPost, formatAge, esc } from './render.js?v=8';
 
 const $ = (s, r = document) => r.querySelector(s);
 const LOVES = 'agentglade.loves';
+const FILTERS = ['all', 'photos', 'milestones'];
 
 let site = {};
-let posts = [];
 let profiles = [];
 const selectedProfile = new URLSearchParams(location.search).get('profile');
-
-const FILTERS = {
-  all: () => true,
-  photos: (p) => (p.media || []).length > 0,
-  milestones: (p) => !!p.milestone,
-};
+// Posts seen so far, by ID, for the lightbox and permalinks.
+const known = new Map();
+const feed = { filter: 'all', next: null, loading: false, generation: 0, summary: null };
 
 function currentFilter() {
   const f = location.hash.slice(1);
-  return FILTERS[f] ? f : 'all';
+  return FILTERS.includes(f) ? f : 'all';
 }
+const linkedId = () => { const h = decodeURIComponent(location.hash.slice(1)); return h && !FILTERS.includes(h) ? h : null; };
 
 function renderProfile() {
   document.title = site.name || 'Agentglade';
@@ -34,36 +32,72 @@ function renderProfile() {
     facts.push(['Age', formatAge(site.born)]);
   }
   if (site.hometown) facts.push(['Hometown', site.hometown]);
-  facts.push(['Posts', String(posts.length)]);
+  facts.push(['Posts', String(feed.summary?.counts.all ?? '')]);
   $('#profile-facts').innerHTML = facts.map(([k, v]) => `<li><span>${esc(k)}</span><span>${esc(v)}</span></li>`).join('');
 }
 
-function renderFeed() {
-  const f = currentFilter();
-  document.querySelectorAll('[data-filter]').forEach((a) => a.setAttribute('aria-current', String(a.dataset.filter === f)));
-  const list = posts.filter(FILTERS[f]);
-  const el = $('#posts');
-  if (!list.length) {
-    el.innerHTML = `<p class="feed-status">No ${f === 'all' ? 'posts' : f} yet.</p>`;
-    return;
-  }
-  el.innerHTML = list.map((p) => renderPost(p, { born: site.born })).join('') +
-    `<p class="feed-end">You're all caught up</p>`;
-  restoreLoves();
+function renderSidebars() {
+  const { counts, recentPhotos, milestones } = feed.summary;
+  for (const [k, count] of Object.entries(counts)) document.querySelectorAll(`[data-count="${k}"]`).forEach((c) => (c.textContent = count));
+  $('#thumbs').innerHTML = recentPhotos.length
+    ? recentPhotos.map((m) => `<button type="button" data-open="${esc(m.postId)}" data-index="${m.index}" aria-label="Open ${esc(m.alt || 'photo')}"><img src="${esc(resolve(m.previewSrc || m.src))}" alt="" loading="lazy"></button>`).join('')
+    : '<p class="card-empty">Photos from posts show up here.</p>';
+  $('#milestones').innerHTML = milestones.length
+    ? milestones.map((p) => `<li><a href="#${encodeURIComponent(p.postId)}"><span><strong>${esc(p.milestone)}</strong><time datetime="${esc(p.publishedAt)}">${esc(new Date(p.publishedAt).toLocaleDateString(undefined, { dateStyle: 'medium' }))}</time></span></a></li>`).join('')
+    : '<li class="card-empty">Mark a post as a milestone and it lands here.</li>';
 }
 
-function renderSidebars() {
-  for (const [k, fn] of Object.entries(FILTERS)) {
-    document.querySelectorAll(`[data-count="${k}"]`).forEach((c) => (c.textContent = posts.filter(fn).length));
+// The end of the list: a button (also loaded by scrolling near it), or the end marker.
+function renderEnd() {
+  $('#feed-more')?.remove();
+  const el = $('#posts');
+  if (feed.next) {
+    el.insertAdjacentHTML('beforeend', `<div class="feed-more" id="feed-more"><button type="button" class="button button-small" data-more>${feed.loading ? 'Loading…' : 'Load older posts'}</button></div>`);
+    observer?.observe($('#feed-more'));
+  } else if (known.size) el.insertAdjacentHTML('beforeend', `<p class="feed-end" id="feed-more">You're all caught up</p>`);
+}
+
+async function loadPage(reset = false) {
+  if (feed.loading || (!reset && !feed.next)) return;
+  const generation = reset ? ++feed.generation : feed.generation;
+  feed.loading = true;
+  if (reset) { feed.filter = currentFilter(); feed.next = null; }
+  document.querySelectorAll('[data-filter]').forEach((a) => a.setAttribute('aria-current', String(a.dataset.filter === feed.filter)));
+  const button = $('[data-more]'); if (button) { button.disabled = true; button.textContent = 'Loading…'; }
+  try {
+    const page = await loadFeedPage({ before: reset ? null : feed.next, filter: feed.filter, profile: selectedProfile });
+    if (generation !== feed.generation) return;
+    const el = $('#posts');
+    if (reset) el.replaceChildren();
+    $('#feed-more')?.remove();
+    for (const post of page.posts) {
+      known.set(post.id, post);
+      if (!document.getElementById(post.id)) el.insertAdjacentHTML('beforeend', renderPost(post, { born: site.born }));
+    }
+    feed.next = page.nextCursor;
+    if (reset && !page.posts.length) el.innerHTML = `<p class="feed-status">No ${feed.filter === 'all' ? 'posts' : feed.filter} yet.</p>`;
+    restoreLoves();
+  } catch (err) {
+    console.error(err);
+    if (reset) $('#posts').innerHTML = '<p class="feed-status is-error">Couldn\'t load posts. Refresh to try again.</p>';
+  } finally {
+    if (generation === feed.generation) { feed.loading = false; renderEnd(); }
   }
-  const thumbs = posts.flatMap((p) => (p.media || []).map((m, i) => ({ p, m, i }))).filter(({ m }) => m.type !== 'video').slice(0, 9);
-  $('#thumbs').innerHTML = thumbs.length
-    ? thumbs.map(({ p, m, i }) => `<button type="button" data-open="${esc(p.id)}" data-index="${i}" aria-label="Open ${esc(m.alt || 'photo')}"><img src="${esc(resolve(m.previewSrc || m.src))}" alt="" loading="lazy"></button>`).join('')
-    : '<p class="card-empty">Photos from posts show up here.</p>';
-  const ms = posts.filter((p) => p.milestone);
-  $('#milestones').innerHTML = ms.length
-    ? ms.map((p) => `<li><a href="#${encodeURIComponent(p.id)}"><span><strong>${esc(p.milestone)}</strong><time datetime="${esc(p.publishedAt)}">${esc(new Date(p.publishedAt).toLocaleDateString(undefined, { dateStyle: 'medium' }))}</time></span></a></li>`).join('')
-    : '<li class="card-empty">Mark a post as a milestone and it lands here.</li>';
+}
+
+// A permalinked post is shown above the feed when it is not already on the page.
+async function showLinked(id) {
+  $('#feed-linked')?.remove();
+  let element = document.getElementById(id);
+  if (!element) {
+    let post;
+    try { post = known.get(id) || await loadFeedPost(id); } catch { return; }
+    known.set(post.id, post);
+    $('#posts').insertAdjacentHTML('beforebegin', `<section class="feed-linked" id="feed-linked" aria-label="Linked post"><p class="feed-linked-note"><span>Linked post</span><a href="#all">Show all posts</a></p>${renderPost(post, { born: site.born })}</section>`);
+    element = document.getElementById(id);
+    restoreLoves();
+  }
+  element?.scrollIntoView();
 }
 
 /* ---- Love (saved on this device only until there's a backend) ---- */
@@ -85,9 +119,10 @@ function showLightbox() {
   lb.el.querySelector('[data-step="-1"]').disabled = lb.i === 0;
   lb.el.querySelector('[data-step="1"]').disabled = lb.i === lb.media.length - 1;
 }
-function openLightbox(postId, index) {
-  const p = posts.find((x) => x.id === postId);
-  if (!p) return;
+async function openLightbox(postId, index) {
+  let p = known.get(postId);
+  if (!p) { try { p = await loadFeedPost(postId); known.set(p.id, p); } catch { return; } }
+  if (!p.media?.[index]) return;
   lb.media = p.media; lb.i = index;
   showLightbox();
   lb.el.showModal();
@@ -96,6 +131,7 @@ function openLightbox(postId, index) {
 document.addEventListener('click', async (e) => {
   const open = e.target.closest('[data-open]');
   if (open) return openLightbox(open.dataset.open, Number(open.dataset.index));
+  if (e.target.closest('[data-more]')) return loadPage();
 
   const love = e.target.closest('[data-love]');
   if (love) {
@@ -118,7 +154,11 @@ document.addEventListener('click', async (e) => {
   }
 });
 
-function init() {
+const observer = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) loadPage(); }, { rootMargin: '600px' })
+  : null;
+
+async function init() {
   hydrateIcons();
   lb.el = $('#lightbox');
   lb.el.addEventListener('click', (e) => {
@@ -132,28 +172,26 @@ function init() {
     if (e.key === 'ArrowRight') lb.el.querySelector('[data-step="1"]').click();
     if (e.key === 'ArrowLeft') lb.el.querySelector('[data-step="-1"]').click();
   });
-
-  Promise.all([loadSite(), loadPosts(), loadProfiles()])
-    .then(([s, p, directory]) => {
-      profiles = directory; setProfileDirectory(profiles);
-      site = s; posts = p;
-      const profile = selectedProfile && profiles.find((item) => item.id === selectedProfile);
-      if (profile) site = { ...site, name: profile.name, handle: profile.id, bio: profile.bio, avatar: profile.avatarPreview || profile.avatar };
-      if (selectedProfile) posts = posts.filter((post) => postProfileId(post) === selectedProfile);
-      renderProfile(); renderSidebars(); renderFeed();
-      // Scroll to a permalinked post once rendered.
-      const id = decodeURIComponent(location.hash.slice(1));
-      if (id && !FILTERS[id]) document.getElementById(id)?.scrollIntoView();
-    })
-    .catch((err) => {
-      console.error(err);
-      $('#posts').innerHTML = '<p class="feed-status is-error">Couldn\'t load posts. Refresh to try again.</p>';
-    });
-
   addEventListener('hashchange', () => {
-    const h = location.hash.slice(1);
-    if (FILTERS[h]) { renderFeed(); scrollTo({ top: 0 }); }
+    const id = linkedId();
+    if (id) return showLinked(id);
+    $('#feed-linked')?.remove();
+    if (currentFilter() !== feed.filter || !location.hash) { loadPage(true); scrollTo({ top: 0 }); }
   });
+
+  try {
+    const [s, directory, summary] = await Promise.all([loadSite(), loadProfiles(), loadFeedSummary(selectedProfile)]);
+    profiles = directory; setProfileDirectory(profiles);
+    site = s; feed.summary = summary;
+    const profile = selectedProfile && profiles.find((item) => item.id === selectedProfile);
+    if (profile) site = { ...site, name: profile.name, handle: profile.id, bio: profile.bio, avatar: profile.avatarPreview || profile.avatar };
+    renderProfile(); renderSidebars();
+  } catch (err) {
+    console.error(err);
+  }
+  await loadPage(true);
+  const id = linkedId();
+  if (id) await showLinked(id);
 }
 
 init();

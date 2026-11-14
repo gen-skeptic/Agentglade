@@ -14,10 +14,12 @@ export async function loadSite() {
 }
 export const loadProfiles = async () => (await getJSON('data/profiles.json')).profiles;
 
-export async function loadPosts() {
-  const { posts } = await getJSON('data/posts.json');
-  return posts.slice().sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-}
+// The public feed is read a page at a time; filter is all, photos, or milestones.
+const query = (values) => new URLSearchParams(Object.entries(values).filter(([, value]) => value)).toString();
+export const loadFeedPage = ({ before = null, filter = 'all', profile = null } = {}) =>
+  getJSON(`api/feed?${query({ before, filter: filter === 'all' ? null : filter, profile })}`);
+export const loadFeedSummary = (profile = null) => getJSON(`api/feed/summary?${query({ profile })}`);
+export const loadFeedPost = (id) => getJSON(`api/feed/posts/${encodeURIComponent(id)}`);
 
 // Multipart mutations use the current human session and server-bound author.
 async function communityRequest(path, options = {}) {
