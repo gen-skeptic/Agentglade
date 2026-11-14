@@ -367,61 +367,75 @@ async function writeAgentReceipt(file, receipt) {
 }
 async function publishAgent(input, who, key, dryRun) {
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
+  // One agent publication at a time in this process, so no other request can
+  // claim this idempotency key while its photos are processed below.
   if (agentPublishing) fail(429, 'Another agent post is processing. Retry with the same idempotency key.');
   agentPublishing = true;
   try {
-    return await withLock(async () => {
-      const requestHash = crypto.createHash('sha256').update(JSON.stringify({ text: input.text, milestone: input.milestone, publishedAt: input.publishedAt,
-        files: await Promise.all(input.files.map(async (file, i) => ({ type: file.type, alt: input.meta[i]?.alt || '', hash: crypto.createHash('sha256').update(Buffer.from(await file.arrayBuffer())).digest('hex') }))) })).digest('hex');
-      const directory = path.join(DATA_DIR, '.agent-receipts');
-      const keyHash = crypto.createHash('sha256').update(who.user + ':' + key).digest('hex');
-      const receiptPath = path.join(directory, keyHash + '.json');
-      const doc = await readPosts();
+    const requestHash = crypto.createHash('sha256').update(JSON.stringify({ text: input.text, milestone: input.milestone, publishedAt: input.publishedAt,
+      files: await Promise.all(input.files.map(async (file, i) => ({ type: file.type, alt: input.meta[i]?.alt || '', hash: crypto.createHash('sha256').update(Buffer.from(await file.arrayBuffer())).digest('hex') }))) })).digest('hex');
+    const directory = path.join(DATA_DIR, '.agent-receipts');
+    const keyHash = crypto.createHash('sha256').update(who.user + ':' + key).digest('hex');
+    const receiptPath = path.join(directory, keyHash + '.json');
+    // Answer a retry from its receipt. Called under the write lock.
+    const replay = async (doc) => {
       let receipt;
       try { receipt = JSON.parse(await fsp.readFile(receiptPath, 'utf8')); }
       catch (cause) { if (cause.code !== 'ENOENT') throw cause; }
-      if (receipt) {
-        if (receipt.requestHash !== requestHash) fail(409, 'This idempotency key was used for different content.');
-        const previous = doc.posts.find((post) => post.id === receipt.postId);
-        if (!previous) fail(receipt.state === 'committed' ? 410 : 409, receipt.state === 'committed' ? 'The original post was removed. It will not be recreated by a retry.' : 'The previous attempt is incomplete. Ask the owner to review it before changing the key.');
-        if (receipt.state !== 'committed') await writeAgentReceipt(receiptPath, { ...receipt, state: 'committed' });
-        return { post: editable(previous), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(previous.id)}`, replayed: true };
-      }
+      if (!receipt) return null;
+      if (receipt.requestHash !== requestHash) fail(409, 'This idempotency key was used for different content.');
+      const previous = doc.posts.find((post) => post.id === receipt.postId);
+      if (!previous) fail(receipt.state === 'committed' ? 410 : 409, receipt.state === 'committed' ? 'The original post was removed. It will not be recreated by a retry.' : 'The previous attempt is incomplete. Ask the owner to review it before changing the key.');
+      if (receipt.state !== 'committed') await writeAgentReceipt(receiptPath, { ...receipt, state: 'committed' });
+      return { post: editable(previous), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(previous.id)}`, replayed: true };
+    };
+    const admitted = await withLock(async () => {
+      const replayed = await replay(await readPosts());
+      if (replayed) return { replayed };
       const now = Date.now(), recent = agentRates.get(who.user);
       const rate = recent && now - recent.started < 3600000 ? recent : { started: now, creates: 0, attempts: 0, minute: now };
       if (now - rate.minute >= 60000) { rate.minute = now; rate.attempts = 0; }
       if (++rate.attempts > 12 || (!dryRun && rate.creates >= 12)) fail(429, 'Agent publication limit reached. Reuse the same key after the rate window resets.');
       agentRates.set(who.user, rate);
-      const author = await postAuthor(who);
-      if (dryRun) {
-        const photos = [];
-        for (const file of input.files) if (file.type.startsWith('image/')) {
-          const photo = await preparePhoto(file); photos.push({ width: photo.width, height: photo.height, format: 'webp' });
-        }
-        return { dryRun: true, author: author.author, profileId: author.profileId, photos, published: false };
-      }
-      const publishedAt = input.publishedAt || new Date().toISOString();
-      const media = await storeMedia(input, publishedAt);
-      const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...author, publishedAt,
-        milestone: input.milestone, text: input.text, media };
-      await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
-      const audit = path.join(DATA_DIR, '.agent-audit.jsonl');
-      const record = { at: new Date().toISOString(), action: 'publish', actor: who.user, keyHash, postId: post.id };
-      try {
-        await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
-        await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
-        await writePosts({ ...doc, posts: [...doc.posts, post] });
-      } catch (cause) {
-        await removeUnused(media, doc);
-        await fsp.unlink(receiptPath).catch(() => {});
-        throw cause;
-      }
-      rate.creates++;
-      // A crash here leaves a pending receipt plus a published post; retries find it.
-      await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'committed' });
-      await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'committed' }) + '\n', { mode: 0o600 });
-      return { post: editable(post), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(post.id)}`, replayed: false };
+      return { rate, author: await postAuthor(who) };
     });
+    if (admitted.replayed) return admitted.replayed;
+    const { rate, author } = admitted;
+    // Photo processing runs outside the write lock so members are not held up.
+    if (dryRun) {
+      const photos = [];
+      for (const file of input.files) if (file.type.startsWith('image/')) {
+        const photo = await preparePhoto(file); photos.push({ width: photo.width, height: photo.height, format: 'webp' });
+      }
+      return { dryRun: true, author: author.author, profileId: author.profileId, photos, published: false };
+    }
+    const publishedAt = input.publishedAt || new Date().toISOString();
+    const media = await storeMedia(input, publishedAt);
+    try {
+      return await withLock(async () => {
+        const doc = await readPosts();
+        const replayed = await replay(doc); // Cannot happen while agentPublishing is held; checked anyway.
+        if (replayed) { await removeUnused(media); return replayed; }
+        const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...author, publishedAt,
+          milestone: input.milestone, text: input.text, media };
+        await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+        const audit = path.join(DATA_DIR, '.agent-audit.jsonl');
+        const record = { at: new Date().toISOString(), action: 'publish', actor: who.user, keyHash, postId: post.id };
+        try {
+          await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
+          await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
+          await writePosts({ ...doc, posts: [...doc.posts, post] });
+        } catch (cause) {
+          await fsp.unlink(receiptPath).catch(() => {});
+          throw cause;
+        }
+        rate.creates++;
+        // A crash here leaves a pending receipt plus a published post; retries find it.
+        await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'committed' });
+        await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'committed' }) + '\n', { mode: 0o600 });
+        return { post: editable(post), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(post.id)}`, replayed: false };
+      });
+    } catch (cause) { await removeUnused(media); throw cause; }
   } finally { agentPublishing = false; }
 }
 
