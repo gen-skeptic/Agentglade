@@ -16,6 +16,7 @@ services:
       MEMBER_ACCOUNTS: '${MEMBER_ACCOUNTS:-{}}'
       MEMBER_ADMINS: ${MEMBER_ADMINS:-[]}
       MEMBER_ROLES: ${MEMBER_ROLES:-[]}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-[]}
     secrets:
       - source: auth
         target: auth.json

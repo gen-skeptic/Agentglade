@@ -98,6 +98,7 @@ retention/backup policy. This project does not provide a cluster backup service.
 | `MEMBER_ACCOUNTS` | `{}` | Optional JSON map of proxy subjects to names/profile IDs. |
 | `MEMBER_ADMINS` | `[]` | Explicit proxy administrator subjects present in `MEMBER_ACCOUNTS`. |
 | `MEMBER_ROLES` | `[]` | Optional allowed proxy group/role names; exact, case-sensitive matching. |
+| `TRUSTED_PROXIES` | `[]` | JSON list of reverse-proxy IP addresses or CIDR ranges. Only connections from these addresses may supply `X-Forwarded-For`, which then gives each visitor their own sign-in rate limit. |
 
 The public feed and uploaded media are intentionally public. Use TLS before
 sending credentials across a network. The bundled PWA camera and service worker

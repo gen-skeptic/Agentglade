@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import net from 'node:net';
 import { promisify } from 'node:util';
 
 const scrypt = promisify(crypto.scrypt);
@@ -14,11 +15,28 @@ async function verifyPassword(password, encoded) {
   const actual = await scrypt(password, salt, 32);
   return crypto.timingSafeEqual(actual, Buffer.from(expected, 'hex'));
 }
+// "::ffff:192.0.2.1" is how a dual-stack socket reports an IPv4 peer.
+const plainAddress = (address) => /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address || '')?.[1] || address || '';
+// TRUSTED_PROXIES lists the reverse proxies whose X-Forwarded-For is believed.
+export function trustedProxyList(entries) {
+  if (!Array.isArray(entries) || entries.length > 64) throw new Error('TRUSTED_PROXIES must be a JSON array of up to 64 IP addresses or CIDR ranges.');
+  const list = new net.BlockList();
+  for (const entry of entries) {
+    const [address, bits, extra] = typeof entry === 'string' ? entry.split('/') : [];
+    const family = net.isIP(address || '');
+    if (!family || extra !== undefined || (bits !== undefined && (!/^\d{1,3}$/.test(bits) || Number(bits) > (family === 4 ? 32 : 128)))) {
+      throw new Error(`TRUSTED_PROXIES entry ${JSON.stringify(entry)} is not an IP address or CIDR range.`);
+    }
+    if (bits === undefined) list.addAddress(address, family === 4 ? 'ipv4' : 'ipv6');
+    else list.addSubnet(address, Number(bits), family === 4 ? 'ipv4' : 'ipv6');
+  }
+  return list;
+}
 const reply = (res, status, value, headers = {}) => {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
   res.end(JSON.stringify(value));
 };
-export async function createHumanAuth({ configFile, origin }) {
+export async function createHumanAuth({ configFile, origin, trustedProxies = [] }) {
   const config = configFile ? JSON.parse(await fs.readFile(configFile, 'utf8')) : {};
   const admin = config.localAdmin;
   if (admin && (!/^[a-z][a-z0-9-]{0,47}$/.test(admin.username || '') || !/^scrypt\$[a-f0-9]{32}\$[a-f0-9]{64}$/.test(admin.passwordHash || ''))) throw new Error('Invalid local administrator configuration.');
@@ -30,6 +48,21 @@ export async function createHumanAuth({ configFile, origin }) {
   const cookie = (value, age) => `agentglade_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${secure ? '; Secure' : ''}`;
   const sessionToken = (req) => /(?:^|;\s*)agentglade_session=([a-f0-9]{64})(?:;|$)/.exec(req.headers.cookie || '')?.[1];
   const localSubject = admin ? `local:${admin.username}` : null;
+  const proxies = trustedProxyList(trustedProxies);
+  const trusted = (address) => { const family = net.isIP(address); return family !== 0 && proxies.check(address, family === 4 ? 'ipv4' : 'ipv6'); };
+  // The client is the connecting peer, unless that peer is a trusted proxy. Then
+  // walk X-Forwarded-For from the nearest hop: proxies append, so the first
+  // untrusted hop from the right is the one a client cannot forge.
+  function clientAddress(req) {
+    const peer = plainAddress(req.socket.remoteAddress);
+    if (!trusted(peer)) return peer;
+    const hops = String(req.headers['x-forwarded-for'] || '').split(',').map((hop) => plainAddress(hop.trim())).filter(Boolean);
+    for (let i = hops.length - 1; i >= 0; i--) {
+      if (!net.isIP(hops[i])) return peer;
+      if (!trusted(hops[i])) return hops[i];
+    }
+    return hops[0] || peer;
+  }
   function sameOrigin(req) {
     return req.headers.origin === origin && (!req.headers['sec-fetch-site'] || req.headers['sec-fetch-site'] === 'same-origin');
   }
@@ -58,8 +91,8 @@ export async function createHumanAuth({ configFile, origin }) {
       }
       const now = Date.now();
       for (const [key, value] of attempts) if (now - value.started >= 60000) attempts.delete(key);
-      // Ignore caller-supplied forwarding headers when limiting password attempts.
-      const ip = req.socket.remoteAddress, rate = attempts.get(ip) || { started: now, count: 0 };
+      // Forwarding headers count only when a configured trusted proxy sent them.
+      const ip = clientAddress(req), rate = attempts.get(ip) || { started: now, count: 0 };
       attempts.set(ip, rate);
       if (++rate.count > 10 || attempts.size > 10000) { reply(res, 429, { error: 'Too many sign-in attempts. Retry in a minute.' }); return true; }
       let size = 0; const chunks = [];

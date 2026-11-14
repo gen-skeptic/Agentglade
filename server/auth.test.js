@@ -59,3 +59,35 @@ test('password attempts are rate limited independently of spoofed forwarded IPs'
   for (let i = 0; i < 12; i++) limited ||= (await login({ username: 'operator', password: 'wrong' }, { 'X-Forwarded-For': `192.0.2.${i}` })).status === 429;
   assert.equal(limited, true);
 });
+test('behind a trusted proxy, login limits apply per forwarded client and forged hops do not help', async () => {
+  const proxied = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-proxy-test-'));
+  const start = (trusted) => {
+    const server = spawn(process.execPath, ['server/server.js'], { env: { ...process.env, NODE_ENV: 'production', PORT: '0', PUBLIC_ORIGIN: origin, TRUSTED_PROXIES: trusted,
+      AUTH_CONFIG_FILE: path.join(root, 'auth.json'), DATA_DIR: path.join(proxied, 'data'), MEDIA_DIR: path.join(proxied, 'media'), MEMBER_ACCOUNTS: '{}', MEMBER_ADMINS: '[]' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { server, ready: new Promise((resolve, reject) => {
+      let errors = ''; server.stderr.on('data', (data) => { errors += data; });
+      server.once('exit', () => reject(new Error(errors)));
+      server.stdout.on('data', (buffer) => { const match = /listening on :(\d+)/.exec(buffer.toString()); if (match) resolve(`http://127.0.0.1:${match[1]}`); });
+    }) };
+  };
+  const { server, ready } = start('["127.0.0.1", "::1"]');
+  try {
+    const url = await ready;
+    const attempt = (forwardedFor, secret = 'wrong') => fetch(url + '/api/auth/login', { method: 'POST', body: JSON.stringify({ username: 'operator', password: secret }),
+      headers: { Origin: origin, 'Content-Type': 'application/json', 'X-Forwarded-For': forwardedFor } }).then((response) => response.status);
+    for (let i = 0; i < 10; i++) assert.equal(await attempt('198.51.100.7'), 401);
+    assert.equal(await attempt('198.51.100.7'), 429);
+    // A client prepending its own address cannot escape: the proxy appends the real one.
+    assert.equal(await attempt('203.0.113.99, 198.51.100.7'), 429);
+    // Other people behind the same proxy can still sign in.
+    assert.equal(await attempt('198.51.100.8', password), 200);
+    // Trusted hops are skipped to find the client; an IPv4-mapped address is the same client.
+    assert.equal(await attempt('198.51.100.9, 127.0.0.1'), 401);
+    assert.equal(await attempt('::ffff:198.51.100.7'), 429);
+  } finally { const exited = once(server, 'exit'); server.kill(); await exited; }
+  for (const invalid of ['["10.0.0.0/33"]', '["proxy.internal"]', 'not json']) {
+    const { server: refused, ready: failed } = start(invalid);
+    await assert.rejects(failed.then(async () => { const exited = once(refused, 'exit'); refused.kill(); await exited; }), /TRUSTED_PROXIES/);
+  }
+  await fs.rm(proxied, { recursive: true, force: true });
+});

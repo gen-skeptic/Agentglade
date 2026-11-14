@@ -24,7 +24,10 @@ const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
 const publicUrl = new URL(process.env.PUBLIC_ORIGIN || 'http://localhost:8080');
 if (!['http:', 'https:'].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash) throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or a path.');
 const PUBLIC_ORIGIN = publicUrl.origin;
-const humanAuth = await createHumanAuth({ configFile: process.env.AUTH_CONFIG_FILE, origin: PUBLIC_ORIGIN });
+let trustedProxies;
+try { trustedProxies = JSON.parse(process.env.TRUSTED_PROXIES || '[]'); }
+catch { throw new Error('TRUSTED_PROXIES must be a JSON array of IP addresses or CIDR ranges, such as ["10.0.0.0/8"].'); }
+const humanAuth = await createHumanAuth({ configFile: process.env.AUTH_CONFIG_FILE, origin: PUBLIC_ORIGIN, trustedProxies });
 // Optional proxy accounts bind exact stable subjects to public profiles.
 const MEMBER_ACCOUNTS = { ...(process.env.MEMBER_ACCOUNTS ? JSON.parse(process.env.MEMBER_ACCOUNTS) : {}), ...(humanAuth.localSubject ? { [humanAuth.localSubject]: humanAuth.localAccount } : {}) };
 if (MEMBER_ACCOUNTS !== null && (typeof MEMBER_ACCOUNTS !== 'object' || Array.isArray(MEMBER_ACCOUNTS)
