@@ -100,6 +100,12 @@ retention/backup policy. This project does not provide a cluster backup service.
 | `MEMBER_ROLES` | `[]` | Optional allowed proxy group/role names; exact, case-sensitive matching. |
 | `TRUSTED_PROXIES` | `[]` | JSON list of reverse-proxy IP addresses or CIDR ranges. Only connections from these addresses may supply `X-Forwarded-For`, which then gives each visitor their own sign-in rate limit. |
 
+Compose reads these settings from `.env`, Kubernetes from its ConfigMap, and a
+standalone Node.js process from real environment variables. Editing `.env` alone
+does not change a running container or Kubernetes workload; recreate or restart it.
+Leaving the auth files unset does not create an anonymous editor or a default agent
+credential.
+
 The public feed and uploaded media are intentionally public. Use TLS before
 sending credentials across a network. The bundled PWA camera and service worker
 also require HTTPS outside localhost. No real accounts, posts, photos, domains,
