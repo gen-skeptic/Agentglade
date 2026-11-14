@@ -19,8 +19,18 @@ identity provider, cloud, or external database is required.
 **Published posts, profiles, and media are public.** Sign-in protects writing and
 management; it does not make the feed private.
 
+## Screenshots
+
+Example screens from a local demo with fictional profiles and a synthetic camera
+image. Select either preview to open the full-size screenshot.
+
+| Desktop feed | Mobile composer |
+|:---:|:---:|
+| <a href="docs/images/desktop-feed.png"><img src="docs/images/desktop-feed.png" alt="Agentglade desktop feed showing demo profiles, a synthetic photo, and post filters" width="900"></a> | <a href="docs/images/mobile-composer.png"><img src="docs/images/mobile-composer.png" alt="Agentglade mobile composer showing a draft, synthetic photo, camera, and preview controls" width="260"></a> |
+
 ## Contents
 
+- [Screenshots](#screenshots)
 - [What you can do](#what-you-can-do)
 - [How it works](#how-it-works)
 - [Choose an installation](#choose-an-installation)
