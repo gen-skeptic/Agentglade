@@ -3,18 +3,20 @@ import { getSession } from './auth.js?v=8';
 import { createPost, updatePost, loadPost, loadSite, loadProfiles, resolve } from './data.js?v=8';
 import { setProfileDirectory } from './profile-directory.js?v=8';
 import { renderPost, esc } from './render.js?v=8';
-import { loadFields, saveFields, loadMedia, saveMedia, clearDraft } from './drafts.js?v=8';
-import { normalizeFile, preparePreview } from './media.js?v=8';
+import { loadFields, saveFields, loadMedia, saveMedia, clearDraft, loadServerDraft, saveServerDraft, uploadDraftMedia, deleteDraftMedia, deleteServerDraft, draftMediaUrl } from './drafts.js?v=8';
+import { normalizeFile, preparePreview, prepareMedia } from './media.js?v=8';
 import { setupCamera } from './camera.js?v=8';
 
 const $ = (s) => document.querySelector(s);
 const editId = new URLSearchParams(location.search).get('edit');
 const scope = editId ? `edit:${editId}` : 'new';
 const MAX_FILES = 20;
-const state = { files: [], existing: [], alts: new Map(), describing: null, urls: new Map(), previews: new Map(), previewJobs: 0, milestoneOn: false, saving: false, ready: false, finished: false };
+// remote: file → its copy in the account's draft; remoteOnly: placeholders for media saved from another device.
+const state = { files: [], existing: [], alts: new Map(), remote: new Map(), remoteOnly: new Set(), syncOn: false, uploading: 0, dirty: false, edits: 0, editedAt: 0, syncedAt: null, describing: null, urls: new Map(), previews: new Map(), previewJobs: 0, milestoneOn: false, saving: false, ready: false, finished: false };
 let session, original, site = {}, draftTimer, toastTimer;
 let mediaSave = Promise.resolve(true);
 let previewQueue = Promise.resolve();
+let uploads = Promise.resolve(), serverTimer;
 const el = {
   form: $('#composer'), fields: $('#compose-fields'), text: $('#text'), tray: $('#tray'),
   chips: $('#chips'), post: $('#post-btn'), when: $('#when'), milestone: $('#milestone'),
@@ -28,6 +30,7 @@ const localDate = (value = new Date()) => {
 };
 const hasContent = () => !!el.text.value.trim() || state.files.length > 0 || state.existing.length > 0;
 const urlFor = (file) => {
+  if (state.remoteOnly.has(file)) return draftMediaUrl(scope, state.remote.get(file));
   if (!state.urls.has(file)) state.urls.set(file, URL.createObjectURL(state.previews.get(file) || file));
   return state.urls.get(file);
 };
@@ -62,18 +65,58 @@ function fields() {
 function persistDraft() {
   clearTimeout(draftTimer);
   if (!state.ready || state.saving || state.finished) return;
+  state.dirty = true; state.edits++; state.editedAt = Date.now();
+  if (state.syncOn) el.draft.textContent = 'Saving draft to your account…';
   draftTimer = setTimeout(() => {
-    const saved = saveFields(fields(), scope);
-    el.draft.textContent = saved ? 'Draft saved on this device' : 'This device could not save your draft.';
+    const saved = saveFields(fields(), scope, { dirty: true, editedAt: state.editedAt });
+    if (!state.syncOn) el.draft.textContent = saved ? 'Draft saved on this device' : 'This device could not save your draft.';
+    scheduleServerSave();
   }, 400);
 }
+/* ---- The copy of the draft saved to the member's account ---- */
+function scheduleServerSave() {
+  clearTimeout(serverTimer);
+  if (!state.syncOn || !state.ready || state.saving || state.finished) return;
+  el.draft.textContent = 'Saving draft to your account…';
+  serverTimer = setTimeout(saveToServer, 1200);
+}
+async function saveToServer() {
+  clearTimeout(serverTimer);
+  if (!state.syncOn || state.finished) return;
+  const media = state.files.filter((file) => state.remote.has(file)).map((file) => ({ id: state.remote.get(file), alt: state.alts.get(file) || '' }));
+  const edits = state.edits;
+  try {
+    const saved = await saveServerDraft(scope, { fields: fields(), media });
+    // Clean only if nothing changed while saving; otherwise the next save carries it.
+    state.syncedAt = saved.updatedAt;
+    if (edits === state.edits && !state.finished) { state.dirty = false; saveFields(fields(), scope, { dirty: false, syncedAt: saved.updatedAt, editedAt: state.editedAt }); }
+    if (!state.uploading) el.draft.textContent = 'Draft saved to your account';
+  } catch { el.draft.textContent = 'Draft saved on this device. It syncs to your account when you are back online.'; }
+}
+// Photos are prepared and saved to the account as they are added, one at a time.
+function queueUpload(file) {
+  if (!state.syncOn || state.remote.has(file) || !state.files.includes(file)) return uploads;
+  state.uploading++;
+  el.draft.textContent = 'Saving photos to your account…';
+  uploads = uploads.then(async () => {
+    if (!state.files.includes(file) || state.remote.has(file) || state.finished) return;
+    const [prepared] = await prepareMedia([file]);
+    const { id } = await uploadDraftMedia(scope, prepared.file);
+    if (!state.files.includes(file)) { deleteDraftMedia(scope, id); return; }
+    state.remote.set(file, id);
+    persistMedia();
+  }).catch((error) => { toast(`${file.name} is saved on this device only: ${error.message}`, 'error'); })
+    .finally(() => { state.uploading--; if (!state.uploading) saveToServer(); });
+  return uploads;
+}
 function persistMedia() {
-  const snapshot = state.files.map((file) => ({ file, alt: state.alts.get(file) || '' }));
+  const snapshot = state.files.map((file) => ({ file, alt: state.alts.get(file) || '', remoteId: state.remote.get(file) || null, remoteOnly: state.remoteOnly.has(file) }));
   mediaSave = mediaSave.then(() => saveMedia(snapshot, scope));
   mediaSave.then((ok) => { if (!ok) toast('This device could not save draft photos. Keep this page open until you post.', 'error'); });
 }
 function queuePreviews(files) {
-  for (const file of files.filter((item) => item.type.startsWith('image/'))) {
+  for (const file of files) if (state.remoteOnly.has(file)) state.previews.set(file, 'remote');
+  for (const file of files.filter((item) => item.type.startsWith('image/') && !state.remoteOnly.has(item))) {
     state.previewJobs++;
     previewQueue = previewQueue.then(async () => {
       try {
@@ -113,7 +156,20 @@ function renderTray() {
   }));
 }
 async function restoreDraft() {
-  const draft = loadFields(scope);
+  // Which copy wins: a clean copy here (no unsaved edits) follows the account, and is
+  // dropped once the draft was posted or discarded elsewhere. Unsaved edits here win
+  // unless the account also changed since this device last synced; then the newer does.
+  let local = loadFields(scope), localMedia = await loadMedia(scope);
+  let server = null, finished = false;
+  if (session?.user) {
+    try { const found = await loadServerDraft(scope); finished = !!found?.finishedAt; server = finished ? null : found; state.syncOn = true; } catch { state.syncOn = false; }
+  }
+  const useServer = !!server && (!local.dirty || (local.syncedAt !== server.updatedAt && !(local.savedAt > Date.parse(server.updatedAt))));
+  if (finished && !local.dirty) { await clearDraft(scope); local = {}; localMedia = []; }
+  state.dirty = !useServer && !!local.dirty;
+  state.syncedAt = useServer ? server.updatedAt : local.syncedAt || null;
+  state.editedAt = useServer ? Date.parse(server.updatedAt) : local.savedAt || 0;
+  const draft = useServer ? server.fields : local;
   const restored = Object.hasOwn(draft, 'text');
   el.text.value = restored ? draft.text : original?.text || '';
   el.milestone.value = restored ? draft.milestone || '' : original?.milestone || '';
@@ -126,12 +182,32 @@ async function restoreDraft() {
     state.existing = state.existing.filter((m) => kept.has(m.src)).map((m) => typeof kept.get(m.src) === 'string' ? { ...m, alt: kept.get(m.src) } : m);
   }
   if (restored && original && draft.version) original.version = draft.version;
-  const saved = await loadMedia(scope);
-  state.files = saved.map(({ file }) => file);
-  for (const { file, alt } of saved) if (alt) state.alts.set(file, alt);
+  if (useServer) {
+    // Reuse media this device already holds; show the rest straight from the account.
+    const held = new Map(localMedia.filter((m) => m.remoteId && !m.remoteOnly).map((m) => [m.remoteId, m.file]));
+    state.files = server.media.map((m) => {
+      const file = held.get(m.id) || new File([], m.name, { type: m.type });
+      if (!held.has(m.id)) state.remoteOnly.add(file);
+      state.remote.set(file, m.id);
+      if (m.alt) state.alts.set(file, m.alt);
+      return file;
+    });
+    saveFields(draft, scope, { dirty: false, syncedAt: server.updatedAt, editedAt: state.editedAt });
+    persistMedia();
+  } else {
+    state.files = localMedia.map(({ file, alt, remoteId, remoteOnly }) => {
+      if (remoteId) state.remote.set(file, remoteId);
+      if (remoteOnly) state.remoteOnly.add(file);
+      if (alt) state.alts.set(file, alt);
+      return file;
+    });
+  }
   queuePreviews(state.files);
   renderTray(); autosize(); sync({ persist: false });
-  if (restored || state.files.length) el.draft.textContent = 'Draft restored on this device';
+  if (useServer) el.draft.textContent = 'Draft restored from your account';
+  else if (restored || state.files.length) el.draft.textContent = 'Draft restored on this device';
+  // This device has unsaved edits: bring the account's copy up to date.
+  if (state.syncOn && state.dirty && (restored || state.files.length)) { state.files.forEach(queueUpload); if (!state.uploading) saveToServer(); }
 }
 function addFiles(files) {
   if (state.saving) return;
@@ -146,6 +222,7 @@ function addFiles(files) {
   state.files.push(...added);
   queuePreviews(added);
   renderTray(); persistMedia(); sync();
+  added.forEach(queueUpload);
 }
 // Photo descriptions (alt text) for people using screen readers or when a photo cannot load.
 function openDescription(target) {
@@ -196,20 +273,30 @@ async function submit(event) {
   event.preventDefault();
   if (state.saving || state.previewJobs > 0 || !state.ready || !session?.user || !hasContent()) return;
   clearTimeout(draftTimer);
-  saveFields(fields(), scope);
+  saveFields(fields(), scope, { dirty: state.dirty, editedAt: state.editedAt });
   setBusy(true);
   $('#upload-status').hidden = false;
   try {
     await mediaSave;
+    // Post by reference when every photo is in the account's draft; else upload them now.
+    let draftMedia = null;
+    if (state.syncOn) {
+      state.files.forEach(queueUpload);
+      await uploads;
+      if (state.files.every((file) => state.remote.has(file))) draftMedia = state.files.map((file) => ({ id: state.remote.get(file), alt: state.alts.get(file) || '' }));
+    }
+    if (!draftMedia && state.files.some((file) => state.remoteOnly.has(file))) throw new Error('Some photos in this draft are saved only in your account. Reconnect and try again.');
     const post = draftPost();
     const input = { text: post.text, milestone: post.milestone, publishedAt: post.publishedAt,
-      files: [...state.files], alts: state.files.map((file) => state.alts.get(file) || ''),
+      files: draftMedia ? [] : [...state.files], alts: state.files.map((file) => state.alts.get(file) || ''),
+      draft: draftMedia && { scope, media: draftMedia },
       retainMedia: state.existing.map((m) => ({ src: m.src, alt: m.alt || '' })) };
     const options = { onStage: (message) => { $('#upload-status').textContent = message; }, ...(editId ? { id: editId, version: original.version } : {}) };
     const saved = await (editId ? updatePost(input, options) : createPost(input, options));
     state.finished = true;
-    clearTimeout(draftTimer);
+    clearTimeout(draftTimer); clearTimeout(serverTimer);
     await clearDraft(scope);
+    if (state.syncOn) await deleteServerDraft(scope);
     toast(editId ? 'Changes saved to the community feed.' : 'Posted to the community feed.', 'success');
     setTimeout(() => location.assign(`../manage/?saved=${encodeURIComponent(saved.id)}`), 600);
   } catch (error) {
@@ -278,6 +365,8 @@ async function init() {
     if (remove) {
       const [file] = state.files.splice(Number(remove.dataset.remove), 1);
       state.previews.delete(file); state.alts.delete(file);
+      if (state.remote.has(file)) { deleteDraftMedia(scope, state.remote.get(file)); state.remote.delete(file); }
+      state.remoteOnly.delete(file);
       if (state.urls.has(file)) { URL.revokeObjectURL(state.urls.get(file)); state.urls.delete(file); }
       renderTray(); persistMedia(); sync();
     }
@@ -300,17 +389,33 @@ async function init() {
   el.sheet.addEventListener('click', (event) => { if (event.target === el.sheet || event.target.closest('[data-close]')) el.sheet.close(); });
   $('#discard-edits').addEventListener('click', async () => {
     if (!confirm('Discard your local edits and reload the saved post?')) return;
-    clearTimeout(draftTimer);
+    clearTimeout(draftTimer); clearTimeout(serverTimer);
+    state.finished = true;
     await mediaSave;
     await clearDraft(scope);
-    state.finished = true;
+    if (state.syncOn) await deleteServerDraft(scope);
     location.reload();
   });
   document.addEventListener('paste', (event) => {
     const files = [...(event.clipboardData?.files || [])];
     if (files.length && !state.saving) { event.preventDefault(); addFiles(files); }
   });
-  addEventListener('pagehide', () => { if (state.ready && !state.saving && !state.finished) saveFields(fields(), scope); });
+  addEventListener('pagehide', () => { if (state.ready && !state.saving && !state.finished) saveFields(fields(), scope, { dirty: state.dirty, editedAt: state.editedAt }); });
+  // Back on this device after editing elsewhere: a clean copy reloads the account's newer one.
+  document.addEventListener('visibilitychange', async () => {
+    if (document.hidden || !state.syncOn || state.dirty || state.saving || state.finished || state.uploading) return;
+    try {
+      const found = await loadServerDraft(scope);
+      if (!state.dirty && (found?.finishedAt || (found?.updatedAt && found.updatedAt !== state.syncedAt))) location.reload();
+    } catch { /* Offline: keep what is here. */ }
+  });
+  // Back online: unsaved edits and photos on this device sync to the account.
+  addEventListener('online', () => {
+    if (!session?.user || state.finished) return;
+    state.syncOn = true;
+    state.files.forEach(queueUpload);
+    if (state.dirty && !state.uploading) saveToServer();
+  });
   trackKeyboard();
   loadSite().then((value) => {
     site = value;

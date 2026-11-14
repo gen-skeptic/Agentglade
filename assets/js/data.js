@@ -82,19 +82,25 @@ export const deletePost = (post) => communityRequest(`api/posts/${encodeURICompo
   method: 'DELETE', headers: { 'If-Match': `"${post.version}"` },
 });
 
-async function savePost({ text, milestone, publishedAt, files, alts = [], retainMedia }, { onStage, id, version } = {}) {
-  const { prepareMedia } = await import('./media.js?v=8');
-  onStage?.('Preparing photos…');
-  const prepared = await prepareMedia(files, { onProgress: onStage });
+// draft: { scope, media: [{ id, alt }] } posts media already saved to the account's draft.
+async function savePost({ text, milestone, publishedAt, files, alts = [], retainMedia, draft }, { onStage, id, version } = {}) {
   const fd = new FormData();
   fd.set('text', text || '');
   if (milestone) fd.set('milestone', milestone);
   fd.set('publishedAt', publishedAt);
-  fd.set('mediaMeta', JSON.stringify(prepared.map(({ width, height }, i) => ({ width, height, alt: alts[i] || '' }))));
   if (id) fd.set('retainMedia', JSON.stringify(retainMedia || []));
-  prepared.forEach(({ file }) => fd.append('media', file, file.name));
+  if (draft) {
+    fd.set('draftScope', draft.scope);
+    fd.set('draftMedia', JSON.stringify(draft.media));
+  } else {
+    const { prepareMedia } = await import('./media.js?v=8');
+    onStage?.('Preparing photos…');
+    const prepared = await prepareMedia(files, { onProgress: onStage });
+    fd.set('mediaMeta', JSON.stringify(prepared.map(({ width, height }, i) => ({ width, height, alt: alts[i] || '' }))));
+    prepared.forEach(({ file }) => fd.append('media', file, file.name));
+  }
 
-  onStage?.('Uploading and optimizing photos…');
+  onStage?.(draft ? 'Publishing and optimizing photos…' : 'Uploading and optimizing photos…');
   return communityRequest(id ? `api/posts/${encodeURIComponent(id)}` : 'api/posts', {
     method: id ? 'PUT' : 'POST', body: fd,
     ...(id ? { headers: { 'If-Match': `"${version}"` } } : {}),

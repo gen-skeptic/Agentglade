@@ -13,6 +13,7 @@ import { createMemberAccess } from './member-access.js';
 import { openPostStore } from './post-store.js';
 import { createVideoProcessor, sniffVideo } from './videos.js';
 import { openLoveStore, memberKey, visitorKey } from './loves.js';
+import { openDraftStore, draftScope } from './drafts.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = path.resolve(process.env.SITE_DIR || path.join(HERE, '..'));
@@ -92,13 +93,13 @@ async function ensureIdentity(req) {
 function requireEdit(who, item, kind) {
   if (!community.canEdit(who, item, kind)) fail(403, 'You can only edit your own posts and profile.');
 }
-async function readJSON(req) {
+async function readJSON(req, limit = 16384) {
   if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
   if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) fail(415, 'Expected JSON.');
   const chunks = []; let size = 0;
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     size += chunk.length;
-    if (size > 16384) { req.resume(); fail(413, 'Request too large.'); }
+    if (size > limit) { req.resume(); fail(413, 'Request too large.'); }
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { fail(400, 'Invalid JSON.'); }
@@ -148,7 +149,7 @@ function withLock(fn) {
 }
 
 // Opened at startup, before the server listens.
-let posts, videos, loves;
+let posts, videos, loves, drafts;
 const newPostId = (publishedAt) => {
   let id;
   do id = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`; while (posts.has(id));
@@ -267,8 +268,24 @@ async function readForm(req) {
   for (const file of files) if (!EXT[file.type]) fail(415, `Unsupported file type: ${file.type || 'unknown'}.`);
   const dryRun = field('dryRun');
   if (dryRun && !['true', 'false'].includes(dryRun)) fail(400, 'dryRun must be true or false.');
-  return { text, milestone, publishedAt: date ? new Date(date).toISOString() : null, meta, retained, files, dryRun: dryRun === 'true' };
+  // A synced draft posts its uploaded photos by reference instead of uploading them again.
+  let draft = null;
+  if (field('draftMedia')) {
+    let refs;
+    try { refs = JSON.parse(field('draftMedia')); } catch { fail(400, 'Invalid draft photos.'); }
+    const scope = draftScope(field('draftScope'));
+    if (!scope || !Array.isArray(refs)) fail(400, 'Invalid draft photos.');
+    if (files.length) fail(400, 'Send photos either as files or from the draft, not both.');
+    draft = { scope, refs };
+  }
+  return { text, milestone, publishedAt: date ? new Date(date).toISOString() : null, meta, retained, files, draft, dryRun: dryRun === 'true' };
 }
+async function useDraftMedia(input, who) {
+  if (!input.draft) return;
+  input.files = await drafts.files(who.user, input.draft.scope, input.draft.refs);
+  input.meta = input.draft.refs.map((ref) => ({ alt: typeof ref.alt === 'string' ? ref.alt : '' }));
+}
+const forgetDraft = (input, who) => input.draft ? drafts.remove(who.user, input.draft.scope).catch(() => {}) : null;
 
 function uploadedPath(src) {
   if (typeof src !== 'string' || !/^media\/\d{4}\/\d{2}\/[^/]+$/.test(src) || src.includes('..')) return null;
@@ -403,6 +420,7 @@ async function archivePost(post, who, action) {
 
 async function createPost(req, res, who) {
   const input = await readForm(req);
+  await useDraftMedia(input, who);
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
   const publishedAt = input.publishedAt || new Date().toISOString();
   // Photo processing can take minutes for a large post. New files stay private
@@ -419,6 +437,7 @@ async function createPost(req, res, who) {
     });
   } catch (err) { await removeUnused(media); await discardVideos(jobs); throw err; }
   startVideos(jobs);
+  await forgetDraft(input, who);
   return send(res, 201, postView(post, who));
 }
 
@@ -430,6 +449,7 @@ async function writeAgentReceipt(file, receipt) {
   await fsp.rename(tmp, file);
 }
 async function publishAgent(input, who, key, dryRun) {
+  if (input.draft) fail(400, 'Agents cannot post from drafts.');
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
   // One agent publication at a time in this process, so no other request can
   // claim this idempotency key while its photos are processed below.
@@ -526,6 +546,7 @@ function planUpdate(req, who, id, input) {
 
 async function updatePost(req, res, who, id) {
   const input = await readForm(req);
+  await useDraftMedia(input, who);
   const { publishedAt } = planUpdate(req, who, id, input);
   const { media: added, jobs } = await storeMedia(input, publishedAt);
   let post;
@@ -540,6 +561,7 @@ async function updatePost(req, res, who, id) {
     });
   } catch (err) { await removeUnused(added); await discardVideos(jobs); throw err; }
   startVideos(jobs);
+  await forgetDraft(input, who);
   return send(res, 200, postView(post, who));
 }
 
@@ -707,23 +729,62 @@ async function serveStatic(req, res, urlPath) {
     'Content-Type': MIME[ext] || 'application/octet-stream',
     'Cache-Control': fresh ? 'no-cache' : file.startsWith(MEDIA_DIR) ? 'private, max-age=31536000, immutable' : 'public, max-age=604800',
     'Last-Modified': stat.mtime.toUTCString(),
-    'Accept-Ranges': 'bytes',
   };
 
-  // Byte ranges, so Safari can play videos.
+  return streamFile(req, res, file, stat.size, headers);
+}
+// Send a file, honoring byte ranges so Safari can play videos.
+function streamFile(req, res, file, size, headers) {
+  headers = { ...headers, 'Accept-Ranges': 'bytes' };
   const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
   if (range) {
-    let start = range[1] === '' ? stat.size - Number(range[2]) : Number(range[1]);
-    let end = range[1] !== '' && range[2] !== '' ? Number(range[2]) : stat.size - 1;
-    end = Math.min(end, stat.size - 1);
-    if (start < 0 || start > end) return send(res, 416, '', { 'Content-Range': `bytes */${stat.size}` });
-    res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Content-Length': end - start + 1 });
+    let start = range[1] === '' ? size - Number(range[2]) : Number(range[1]);
+    let end = range[1] !== '' && range[2] !== '' ? Number(range[2]) : size - 1;
+    end = Math.min(end, size - 1);
+    if (start < 0 || start > end) return send(res, 416, '', { 'Content-Range': `bytes */${size}` });
+    res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${size}`, 'Content-Length': end - start + 1 });
     if (req.method === 'HEAD') return res.end();
     return pipeline(fs.createReadStream(file, { start, end }), res).catch(() => {});
   }
-  res.writeHead(200, { ...headers, 'Content-Length': stat.size });
+  res.writeHead(200, { ...headers, 'Content-Length': size });
   if (req.method === 'HEAD') return res.end();
   return pipeline(fs.createReadStream(file), res).catch(() => {});
+}
+
+/* ---------- drafts synced to a member's account ---------- */
+async function handleDrafts(req, res, who, pathname, url) {
+  const scope = draftScope(url.searchParams.get('scope'));
+  if (!scope) fail(400, 'Unknown draft.');
+  if (pathname === '/api/drafts') {
+    if (req.method === 'GET') {
+      const draft = await drafts.get(who.user, scope);
+      // No draft is not an error: fields is null, with finishedAt once one was posted or discarded.
+      return send(res, 200, draft?.fields ? draft : { fields: null, ...(draft?.finishedAt ? { finishedAt: draft.finishedAt } : {}) });
+    }
+    if (req.method === 'PUT') return send(res, 200, await drafts.save(who.user, scope, await readJSON(req, 131072)));
+    if (req.method === 'DELETE') { if (!sameOrigin(req)) fail(403, 'Cross-site request refused.'); await drafts.remove(who.user, scope); return send(res, 204, ''); }
+    return send(res, 405, { error: 'Use GET, PUT, or DELETE.' }, { Allow: 'GET, PUT, DELETE' });
+  }
+  if (pathname === '/api/drafts/media' && req.method === 'POST') {
+    const file = (await readMultipart(req)).get('media');
+    if (!file || typeof file !== 'object' || !file.size) fail(400, 'Choose a photo or video.');
+    if (!EXT[file.type]) fail(415, `Unsupported file type: ${file.type || 'unknown'}.`);
+    return send(res, 201, await drafts.addMedia(who.user, scope, file));
+  }
+  const match = /^\/api\/drafts\/media\/([a-f0-9]{32})$/.exec(pathname);
+  if (match && (req.method === 'GET' || req.method === 'HEAD')) {
+    const media = await drafts.media(who.user, scope, match[1]);
+    const stat = media && EXT[media.type] && await fsp.stat(media.file).catch(() => null);
+    if (!stat) return send(res, 404, { error: 'Not found.' });
+    // Uploads are shown only to their owner, and never run as a page.
+    return streamFile(req, res, media.file, stat.size, { 'Content-Type': media.type, 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'none'; sandbox" });
+  }
+  if (match && req.method === 'DELETE') {
+    if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
+    await drafts.removeMedia(who.user, scope, match[1]);
+    return send(res, 204, '');
+  }
+  return send(res, 404, { error: 'Not found.' });
 }
 
 /* ---------- router ---------- */
@@ -751,6 +812,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ...who, name: author.author, profileId: author.profileId || null });
       }
       if (pathname === '/api/profiles' && req.method === 'GET') return send(res, 200, { profiles: (await readProfiles()).profiles.map(editable) });
+      if (pathname === '/api/drafts' || pathname.startsWith('/api/drafts/')) return await handleDrafts(req, res, who, pathname, url);
       if (pathname === '/api/me/visitor' && req.method === 'POST') {
         const visitor = visitorKey((await readJSON(req))?.token);
         if (!visitor) fail(400, 'Invalid visitor ID.');
@@ -803,6 +865,8 @@ posts = await openPostStore(DATA_DIR);
 await community.initialize();
 await migrateProfiles();
 loves = await openLoveStore(DATA_DIR);
+drafts = await openDraftStore({ dataDir: DATA_DIR, maxBytes: MAX_UPLOAD });
+await drafts.sweep();
 await loves.compact((id) => posts.has(id));
 videos = await createVideoProcessor({ dataDir: DATA_DIR, mediaPath: uploadedPath, complete: finishVideo });
 await resumeVideos();

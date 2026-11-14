@@ -14,6 +14,10 @@ while it is stopped. An installation from before this layout keeps its posts in
 the original as `/data/posts.json.migrated`, which you can delete once you have
 checked the result.
 
+Drafts synced to members' accounts, with the photos and videos uploaded for them,
+are kept in the private `/data/.drafts/`. Drafts untouched for 90 days are removed
+at startup, as are uploads no draft kept after a day.
+
 Loves are kept in the private `/data/.loves.jsonl`, which stores only hashes of
 member accounts and browser IDs and is compacted at startup.
 
