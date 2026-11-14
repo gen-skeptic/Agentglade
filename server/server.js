@@ -11,6 +11,7 @@ import { createAgentService } from './agents.js';
 import { createHumanAuth } from './auth.js';
 import { createMemberAccess } from './member-access.js';
 import { openPostStore } from './post-store.js';
+import { createVideoProcessor, sniffVideo } from './videos.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = path.resolve(process.env.SITE_DIR || path.join(HERE, '..'));
@@ -146,7 +147,7 @@ function withLock(fn) {
 }
 
 // Opened at startup, before the server listens.
-let posts;
+let posts, videos;
 const newPostId = (publishedAt) => {
   let id;
   do id = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`; while (posts.has(id));
@@ -180,7 +181,7 @@ async function updateProfile(req, res, who, id) {
   // Check access before spending time on the photo, then process it outside the
   // write lock. The checks run again under the lock in case the profile changed.
   editableProfile(await readProfiles());
-  const added = avatar?.size ? await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString()) : [];
+  const added = avatar?.size ? (await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString())).media : [];
   let updated;
   try {
     updated = await withLock(async () => {
@@ -273,7 +274,7 @@ function uploadedPath(src) {
   return path.join(MEDIA_DIR, ...src.split('/').slice(1));
 }
 async function mediaReferences() {
-  const refs = new Set(posts.all().flatMap((post) => (post.media || []).flatMap((m) => [m.src, m.previewSrc].filter(Boolean))));
+  const refs = new Set(posts.all().flatMap((post) => (post.media || []).flatMap((m) => [m.src, m.previewSrc, m.posterSrc].filter(Boolean))));
   const site = JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'site.json'), 'utf8'));
   if (site.avatar) refs.add(site.avatar);
   for (const profile of (await readProfiles()).profiles) {
@@ -297,20 +298,31 @@ async function servedMediaReferences() {
 }
 async function removeUnused(items) {
   const refs = await mediaReferences();
-  for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc].filter(Boolean)))) {
+  for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc, item.posterSrc].filter(Boolean)))) {
     const file = uploadedPath(src);
     if (!file || refs.has(src)) continue;
     try { await fsp.unlink(file); }
     catch (err) { if (err.code !== 'ENOENT') console.warn('Unused media cleanup failed:', path.basename(file), err.code); }
   }
 }
+// Photos are processed now. Videos are saved privately and converted in the
+// background: start the returned jobs once the post is saved (or discard them).
 async function storeMedia(input, publishedAt) {
   const sub = publishedAt.slice(0, 7).replace('-', '/');
   const prefix = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(8).toString('hex')}`;
   await fsp.mkdir(path.join(MEDIA_DIR, sub), { recursive: true });
-  const media = [];
+  const media = [], jobs = [];
   try {
     for (const [i, file] of input.files.entries()) {
+      if (file.type.startsWith('video/')) {
+        if (!videos.available) fail(503, 'Video uploads need ffmpeg on the server. Ask the site owner to install it.');
+        const data = Buffer.from(await file.arrayBuffer()), format = sniffVideo(data.subarray(0, 12));
+        if (!format) fail(415, `${file.name}: choose an MP4, MOV, or WebM video.`);
+        const base = `media/${sub}/${prefix}-${i + 1}`;
+        media.push({ type: 'video', src: `${base}.mp4`, status: 'processing', alt: String(input.meta[i]?.alt || '').trim().slice(0, 300) });
+        jobs.push(await videos.stage({ data, format, src: `${base}.mp4`, posterSrc: `${base}.poster.webp` }));
+        continue;
+      }
       const photo = file.type.startsWith('image/') ? await preparePhoto(file) : null;
       const name = `${prefix}-${i + 1}${photo ? '.webp' : EXT[file.type]}`;
       const src = `media/${sub}/${name}`;
@@ -325,12 +337,61 @@ async function storeMedia(input, publishedAt) {
         if (photo.preview) await fsp.writeFile(uploadedPath(item.previewSrc), photo.preview, { flag: 'wx' });
         continue;
       }
-      await fsp.writeFile(uploadedPath(src), Buffer.from(await file.arrayBuffer()), { flag: 'wx' });
-      const width = Number(input.meta[i]?.width), height = Number(input.meta[i]?.height);
-      if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0 && width <= 100000 && height <= 100000) Object.assign(media.at(-1), { width: Math.round(width), height: Math.round(height) });
     }
-    return media;
-  } catch (err) { await removeUnused(media); throw err; }
+    return { media, jobs };
+  } catch (err) { await removeUnused(media); await discardVideos(jobs); throw err; }
+}
+const startVideos = (jobs) => { for (const job of jobs) videos.start(job); };
+const discardVideos = (jobs) => Promise.all(jobs.map((job) => videos.discard(job)));
+
+// A finished conversion replaces the placeholder (or, for a video published before
+// conversion existed, the original file) unless the post or video was removed meanwhile.
+async function finishVideo(job, result) {
+  await withLock(async () => {
+    const post = posts.all().find((item) => (item.media || []).some((m) => m.type === 'video' && m.src === job.match));
+    const video = post?.media.find((m) => m.src === job.match);
+    if (!video || (job.sourceSrc ? video.posterSrc : video.status !== 'processing')) return;
+    let next;
+    if (result.error) next = job.sourceSrc ? { ...video, transcodeFailed: true } : { ...video, status: 'failed' };
+    else {
+      await fsp.rename(result.tmpVideo, uploadedPath(job.src));
+      await fsp.rename(result.tmpPoster, uploadedPath(job.posterSrc));
+      const { status, transcodeFailed, width, height, duration, ...rest } = video;
+      next = { ...rest, src: job.src, posterSrc: job.posterSrc, width: result.width, height: result.height, ...(result.duration ? { duration: result.duration } : {}) };
+    }
+    await posts.put({ ...post, media: post.media.map((m) => m === video ? next : m) });
+    if (job.sourceSrc && !result.error) await removeUnused([{ src: job.sourceSrc }]);
+  });
+}
+
+// At startup: resume conversions a post still waits for, and convert videos that
+// were published unprocessed by earlier releases (they keep playing meanwhile).
+async function resumeVideos() {
+  // Jobs start only after this pass, so a quick conversion cannot race its writes.
+  const pending = await videos.pending(), waiting = new Set(), start = [];
+  for (const job of pending) {
+    const video = posts.all().flatMap((post) => post.media || []).find((m) => m.type === 'video' && m.src === job.match);
+    const wanted = video && (job.sourceSrc ? !video.posterSrc : video.status === 'processing');
+    if (!wanted) { await videos.discard(job); continue; }
+    waiting.add(job.match);
+    if (videos.available) start.push(job);
+  }
+  for (const post of [...posts.all()]) {
+    let changed = false;
+    const media = await Promise.all((post.media || []).map(async (video) => {
+      if (video.type !== 'video' || video.posterSrc || video.transcodeFailed || waiting.has(video.src)) return video;
+      if (video.status === 'processing') { changed = true; return { ...video, status: 'failed' }; } // Its upload was lost.
+      if (video.status || !videos.available) return video;
+      let format = null;
+      try { const handle = await fsp.open(uploadedPath(video.src)); try { const { buffer } = await handle.read(Buffer.alloc(12), 0, 12, 0); format = sniffVideo(buffer); } finally { await handle.close(); } } catch {}
+      if (!format) { changed = true; return { ...video, transcodeFailed: true }; }
+      const base = video.src.replace(/\.[^./]+$/, '') + '-web';
+      start.push(await videos.stageExisting({ sourceSrc: video.src, format, src: `${base}.mp4`, posterSrc: `${base}.poster.webp` }));
+      return video;
+    }));
+    if (changed) await posts.put({ ...post, media });
+  }
+  startVideos(start);
 }
 async function archivePost(post, who, action) {
   const directory = path.join(DATA_DIR, '.history');
@@ -345,7 +406,7 @@ async function createPost(req, res, who) {
   const publishedAt = input.publishedAt || new Date().toISOString();
   // Photo processing can take minutes for a large post. New files stay private
   // until the post that references them is written, so do it before locking.
-  const media = await storeMedia(input, publishedAt);
+  const { media, jobs } = await storeMedia(input, publishedAt);
   let post;
   try {
     post = await withLock(async () => {
@@ -355,7 +416,8 @@ async function createPost(req, res, who) {
       await posts.put(post);
       return post;
     });
-  } catch (err) { await removeUnused(media); throw err; }
+  } catch (err) { await removeUnused(media); await discardVideos(jobs); throw err; }
+  startVideos(jobs);
   return send(res, 201, postView(post, who));
 }
 
@@ -411,11 +473,12 @@ async function publishAgent(input, who, key, dryRun) {
       return { dryRun: true, author: author.author, profileId: author.profileId, photos, published: false };
     }
     const publishedAt = input.publishedAt || new Date().toISOString();
-    const media = await storeMedia(input, publishedAt);
+    const { media, jobs } = await storeMedia(input, publishedAt);
+    let committed = false;
     try {
-      return await withLock(async () => {
+      const result = await withLock(async () => {
         const replayed = await replay(); // Cannot happen while agentPublishing is held; checked anyway.
-        if (replayed) { await removeUnused(media); return replayed; }
+        if (replayed) { await removeUnused(media); await discardVideos(jobs); return replayed; }
         const post = { id: newPostId(publishedAt), ...author, publishedAt,
           milestone: input.milestone, text: input.text, media };
         await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -425,6 +488,7 @@ async function publishAgent(input, who, key, dryRun) {
           await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
           await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
           await posts.put(post);
+          committed = true;
         } catch (cause) {
           await fsp.unlink(receiptPath).catch(() => {});
           throw cause;
@@ -435,7 +499,9 @@ async function publishAgent(input, who, key, dryRun) {
         await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'committed' }) + '\n', { mode: 0o600 });
         return { post: editable(post), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(post.id)}`, replayed: false };
       });
-    } catch (cause) { await removeUnused(media); throw cause; }
+      if (committed) startVideos(jobs);
+      return result;
+    } catch (cause) { await removeUnused(media); if (!committed) await discardVideos(jobs); else startVideos(jobs); throw cause; }
   } finally { agentPublishing = false; }
 }
 
@@ -460,7 +526,7 @@ function planUpdate(req, who, id, input) {
 async function updatePost(req, res, who, id) {
   const input = await readForm(req);
   const { publishedAt } = planUpdate(req, who, id, input);
-  const added = await storeMedia(input, publishedAt);
+  const { media: added, jobs } = await storeMedia(input, publishedAt);
   let post;
   try {
     post = await withLock(async () => {
@@ -471,7 +537,8 @@ async function updatePost(req, res, who, id) {
       await removeUnused(previous.media || []);
       return updated;
     });
-  } catch (err) { await removeUnused(added); throw err; }
+  } catch (err) { await removeUnused(added); await discardVideos(jobs); throw err; }
+  startVideos(jobs);
   return send(res, 200, postView(post, who));
 }
 
@@ -684,6 +751,8 @@ await seed();
 posts = await openPostStore(DATA_DIR);
 await community.initialize();
 await migrateProfiles();
+videos = await createVideoProcessor({ dataDir: DATA_DIR, mediaPath: uploadedPath, complete: finishVideo });
+await resumeVideos();
 server.listen(PORT, () => console.log(`agentglade listening on :${server.address().port} (data ${DATA_DIR}, media ${MEDIA_DIR})`));
 
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { server.close(() => process.exit(0)); server.closeIdleConnections(); });
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { videos?.stop(); server.close(() => process.exit(0)); server.closeIdleConnections(); });

@@ -112,8 +112,10 @@ const lb = { el: null, media: [], i: 0 };
 function showLightbox() {
   const m = lb.media[lb.i];
   const src = esc(resolve(m.src));
-  $('#lightbox-stage').innerHTML = m.type === 'video'
-    ? `<video src="${src}" controls playsinline autoplay></video>`
+  $('#lightbox-stage').innerHTML = m.type === 'video' && m.status
+    ? `<p class="feed-status">${m.status === 'failed' ? 'This video could not be processed.' : 'This video is still processing.'}</p>`
+    : m.type === 'video'
+    ? `<video src="${src}"${m.posterSrc ? ` poster="${esc(resolve(m.posterSrc))}"` : ''} controls playsinline autoplay></video>`
     : `<img src="${src}" alt="${esc(m.alt || '')}">`;
   $('#lightbox-count').textContent = `${lb.i + 1} / ${lb.media.length}`;
   lb.el.querySelector('[data-step="-1"]').disabled = lb.i === 0;

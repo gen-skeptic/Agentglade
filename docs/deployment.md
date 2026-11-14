@@ -13,6 +13,11 @@ while it is stopped. An installation from before this layout keeps its posts in
 `/data/posts.json`; the first start splits that file into `/data/posts/` and keeps
 the original as `/data/posts.json.migrated`, which you can delete once you have
 checked the result.
+
+Uploaded videos wait in the private `/data/.video-jobs/` until they are converted
+in the background, one at a time, and resume after a restart. Videos published by
+releases before conversion existed are converted at the next start; each original
+is deleted once its converted copy replaces it in the post.
 Do not mount either data volume into another application writer.
 
 Seeds are copied only when the corresponding runtime file is absent. Stopping or
@@ -101,6 +106,7 @@ retention/backup policy. This project does not provide a cluster backup service.
 | `MEDIA_DIR` | `/media` in image | Persistent processed media. |
 | `PORT` | `8080` | Internal HTTP port. |
 | `MAX_UPLOAD_MB` | `64` | Maximum buffered multipart request size in MiB. |
+| `FFMPEG_PATH`, `FFPROBE_PATH` | `ffmpeg`, `ffprobe` on `PATH` | Video conversion tools. Included in the container image; without them, video uploads are refused. |
 | `MEMBER_ACCOUNTS` | `{}` | Optional JSON map of proxy subjects to names/profile IDs. |
 | `MEMBER_ADMINS` | `[]` | Explicit proxy administrator subjects present in `MEMBER_ACCOUNTS`. |
 | `MEMBER_ROLES` | `[]` | Optional allowed proxy group/role names; exact, case-sensitive matching. |

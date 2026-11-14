@@ -92,16 +92,17 @@ function queuePreviews(files) {
 }
 function renderTray() {
   const items = [
-    ...state.existing.map((media, i) => ({ video: media.type === 'video', src: resolve(media.previewSrc || media.src), remove: `data-remove-existing="${i}"`,
+    ...state.existing.map((media, i) => ({ video: media.type === 'video' && !media.status, src: resolve(media.previewSrc || media.src), remove: `data-remove-existing="${i}"`,
+      note: media.status && (media.status === 'failed' ? 'Could not be processed' : 'Processing…'), poster: media.posterSrc && resolve(media.posterSrc),
       alt: media.alt, describe: `data-describe-existing="${i}"` })),
     ...state.files.map((file, i) => ({ video: file.type.startsWith('video/'),
       src: file.type.startsWith('video/') || state.previews.get(file) ? urlFor(file) : null,
       pending: !state.previews.has(file), remove: `data-remove="${i}"`, alt: state.alts.get(file), describe: `data-describe="${i}"` })),
   ];
   const cells = items.map((item, i) => `<li>
-    ${item.video ? `<video src="${esc(item.src)}" muted playsinline preload="metadata"></video><span class="media-play">${icon('play')}</span>` : item.src ? `<img src="${esc(item.src)}" alt="Photo ${i + 1}" data-photo-preview><span class="tray-file-label" hidden>Photo ${i + 1}<br>Preview after posting</span>` : `<span class="tray-file-label">Photo ${i + 1}<br>${item.pending ? 'Preparing preview…' : 'Preview after posting'}</span>`}
+    ${item.note ? `<span class="tray-file-label">Video ${i + 1}<br>${item.note}</span>` : item.video ? `<video src="${esc(item.src)}"${item.poster ? ` poster="${esc(item.poster)}" preload="none"` : ' preload="metadata"'} muted playsinline></video><span class="media-play">${icon('play')}</span>` : item.src ? `<img src="${esc(item.src)}" alt="Photo ${i + 1}" data-photo-preview><span class="tray-file-label" hidden>Photo ${i + 1}<br>Preview after posting</span>` : `<span class="tray-file-label">Photo ${i + 1}<br>${item.pending ? 'Preparing preview…' : 'Preview after posting'}</span>`}
     <span class="tray-index">${i + 1}</span>
-    ${item.video ? '' : `<button type="button" class="tray-alt" ${item.describe} data-described="${!!item.alt}" aria-label="${item.alt ? `Edit the description of photo ${i + 1}` : `Describe photo ${i + 1} for people who can’t see it`}">ALT</button>`}
+    ${item.video || item.note ? '' : `<button type="button" class="tray-alt" ${item.describe} data-described="${!!item.alt}" aria-label="${item.alt ? `Edit the description of photo ${i + 1}` : `Describe photo ${i + 1} for people who can’t see it`}">ALT</button>`}
     <button type="button" class="icon-button tray-remove" ${item.remove} aria-label="Remove ${item.video ? 'video' : 'photo'} ${i + 1}">${icon('x')}</button>
   </li>`);
   if (items.length && items.length < MAX_FILES) cells.push(`<li class="add-cell"><label class="tray-add">${icon('plus', 'icon icon-lg')}Add more<input class="sr-only" type="file" accept="image/*,video/*" multiple></label></li>`);
