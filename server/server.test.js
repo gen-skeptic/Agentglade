@@ -246,11 +246,26 @@ test('a broken photo leaves the post unchanged and rolls back newly generated pr
 test('invalid metadata and foreign retained paths leave published data unchanged', async () => {
   const post = await read();
   for (const body of [form({ meta: null }), form({ retained: ['media/2026/11/other.png'] }),
-    form({ text: '', retained: [] }), form({ publishedAt: 'not-a-date' })]) {
+    form({ text: '', retained: [] }), form({ publishedAt: 'not-a-date' }), form({ publishedAt: '+010000-01-01T00:00:00Z' })]) {
     assert.equal((await call('/api/posts/first', { method: 'PUT', version: post.version, body })).status, 400);
   }
   assert.equal((await read()).version, post.version);
   assert.equal((await call('/api/posts', { method: 'POST', body: form({ files: [{ type: 'image/svg+xml' }] }) })).status, 415);
+  // Years outside 0000–9999 cannot name a media folder; refuse them before storing anything.
+  for (const publishedAt of ['+010000-01-01T00:00:00Z', '-000001-01-01T00:00:00Z']) {
+    assert.equal((await call('/api/posts', { method: 'POST', body: form({ publishedAt, files: [{}] }) })).status, 400);
+  }
+  assert.deepEqual(await fs.readdir(path.join(directory, 'media')), ['2026']);
+  assert.equal((await call('/api/posts')).body.total, 2);
+});
+test('an unparseable upload limit stops startup instead of disabling the limit', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-limit-tests-'));
+  try {
+    for (const value of ['64MB', '0', '-1']) {
+      // Stop a server that wrongly starts, so a regression fails instead of hanging.
+      await assert.rejects(startServer(root, { MAX_UPLOAD_MB: value }).then(({ child: started }) => stopServer(started)), /MAX_UPLOAD_MB must be a positive number/);
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 test('stable pagination continues even when the cursor post is deleted', async () => {
   const page = await call('/api/posts?limit=1');

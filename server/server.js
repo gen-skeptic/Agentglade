@@ -17,7 +17,10 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(SITE_DIR, 'data'
 const MEDIA_DIR = path.resolve(process.env.MEDIA_DIR || path.join(SITE_DIR, 'media'));
 const SEED_DIR = path.join(SITE_DIR, 'data');
 const PORT = Number(process.env.PORT || 8080);
-const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_MB || 64) * 1024 * 1024;
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 64);
+// A typo such as "64MB" would be NaN, and every size comparison against NaN is false.
+if (!Number.isFinite(MAX_UPLOAD_MB) || MAX_UPLOAD_MB <= 0) throw new Error('MAX_UPLOAD_MB must be a positive number of MiB, such as 64.');
+const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
 const publicUrl = new URL(process.env.PUBLIC_ORIGIN || 'http://localhost:8080');
 if (!['http:', 'https:'].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash) throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or a path.');
 const PUBLIC_ORIGIN = publicUrl.origin;
@@ -238,7 +241,8 @@ async function readForm(req) {
   const milestone = field('milestone').trim() || null;
   if (text.length > 20000 || (milestone && milestone.length > 60)) fail(400, 'Post text or milestone is too long.');
   const date = field('publishedAt');
-  if (date && Number.isNaN(new Date(date).getTime())) fail(400, 'Choose a valid post date.');
+  // Post IDs and media folders come from the ISO date, which needs a four-digit year.
+  if (date && (Number.isNaN(new Date(date).getTime()) || !/^\d{4}-/.test(new Date(date).toISOString()))) fail(400, 'Choose a valid post date.');
   let meta, retained;
   try { meta = JSON.parse(field('mediaMeta') || '[]'); retained = form.has('retainMedia') ? JSON.parse(field('retainMedia')) : null; }
   catch { fail(400, 'Invalid media information.'); }
