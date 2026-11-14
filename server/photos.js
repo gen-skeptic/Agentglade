@@ -1,6 +1,17 @@
 import { Worker } from 'node:worker_threads';
 
-export async function preparePhoto(file) {
+// Decode one photo at a time across the whole process. A single large photo can
+// need hundreds of MiB of native memory, so concurrent uploads wait here rather
+// than decoding in parallel. This queue is separate from the post write lock, so
+// waiting for photos never blocks sign-in, reads, or text-only changes.
+let queue = Promise.resolve();
+export function preparePhoto(file) {
+  const run = queue.then(() => decode(file));
+  queue = run.catch(() => {});
+  return run;
+}
+
+async function decode(file) {
   const data = await file.arrayBuffer();
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./photo-worker.js', import.meta.url), {

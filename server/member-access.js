@@ -36,6 +36,11 @@ export function createMemberAccess({ directory, accounts, owners = [], requiredR
     return Object.hasOwn(accounts || {}, who.user);
   }
   const account = (subject) => doc?.accounts.find((a) => a.subject === subject);
+  // True when this member's bound public profile is missing and ensure() must create it.
+  const needsProfile = (who, profiles) => {
+    const profileId = account(who.user)?.profileId;
+    return !profileId || !profiles.some((p) => p.id === profileId);
+  };
   return {
     async initialize() {
       try { doc = JSON.parse(await fs.readFile(file, 'utf8')); validate(doc); }
@@ -45,7 +50,7 @@ export function createMemberAccess({ directory, accounts, owners = [], requiredR
           name: config.name || '', profileId: config.profileId || null, onboarded: !!config.profileId })) });
       }
     },
-    account, allowed,
+    account, allowed, needsProfile,
     session(who) {
       if (!allowed(who)) return null;
       const mapping = account(who.user);
@@ -57,8 +62,8 @@ export function createMemberAccess({ directory, accounts, owners = [], requiredR
     // the next request repairs that exact profile instead of creating a duplicate.
     async ensure(who, profiles) {
       if (!allowed(who)) return null;
+      if (!needsProfile(who, profiles)) return null;
       let mapping = account(who.user);
-      if (mapping?.profileId && profiles.some((p) => p.id === mapping.profileId)) return null;
       if (!mapping && doc.accounts.length >= 250) throw Object.assign(new Error('Community profile limit reached.'), { status: 503 });
       const name = mapping?.name || String(who.displayName || '').trim().slice(0, 60) || 'Community member';
       let id = mapping?.profileId;

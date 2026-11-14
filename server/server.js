@@ -62,7 +62,9 @@ function identity(req) {
 }
 async function ensureIdentity(req) {
   const forwarded = forwardedIdentity(req);
-  if (community.allowed(forwarded)) await withLock(async () => {
+  // Only a first (or interrupted) sign-in creates a profile. Every other request
+  // skips the write lock, so a long upload never stalls unrelated page loads.
+  if (community.allowed(forwarded) && community.needsProfile(forwarded, (await readProfiles()).profiles)) await withLock(async () => {
     const doc = await readProfiles(), profile = await community.ensure(forwarded, doc.profiles);
     if (!profile) return;
     const file = path.join(DATA_DIR, 'profiles.json'), tmp = `${file}.${process.pid}.tmp`;
@@ -152,26 +154,34 @@ async function updateProfile(req, res, who, id) {
   if (typeof name !== 'string' || !name.trim() || name.trim().length > 60 || typeof bio !== 'string' || bio.length > 1000) fail(400, 'Use a name up to 60 characters and a bio up to 1000 characters.');
   if (avatar && (typeof avatar !== 'object' || !avatar.type.startsWith('image/') || !EXT[avatar.type])) fail(415, 'Choose a supported photo for the profile.');
   if (avatar && removeAvatar) fail(400, 'Choose a new photo or remove the old one.');
-  const updated = await withLock(async () => {
-    const doc = await readProfiles(), previous = doc.profiles.find((profile) => profile.id === id);
+  const editableProfile = (doc) => {
+    const previous = doc.profiles.find((profile) => profile.id === id);
     if (!previous) fail(404, 'Profile not found.');
     requireEdit(who, previous, 'profile');
     checkVersion(req, previous);
-    const added = avatar?.size ? await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString()) : [];
-    const next = { ...previous, name: name.trim(), bio: bio.trim(), updatedAt: new Date().toISOString() };
-    if (added.length || removeAvatar) { next.avatar = added[0]?.src || null; next.avatarPreview = added[0]?.previewSrc || null; }
-    const history = path.join(DATA_DIR, '.profile-history');
-    try {
+    return previous;
+  };
+  // Check access before spending time on the photo, then process it outside the
+  // write lock. The checks run again under the lock in case the profile changed.
+  editableProfile(await readProfiles());
+  const added = avatar?.size ? await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString()) : [];
+  let updated;
+  try {
+    updated = await withLock(async () => {
+      const doc = await readProfiles(), previous = editableProfile(doc);
+      const next = { ...previous, name: name.trim(), bio: bio.trim(), updatedAt: new Date().toISOString() };
+      if (added.length || removeAvatar) { next.avatar = added[0]?.src || null; next.avatarPreview = added[0]?.previewSrc || null; }
+      const history = path.join(DATA_DIR, '.profile-history');
       await fsp.mkdir(history, { recursive: true, mode: 0o700 });
       await fsp.writeFile(path.join(history, `${Date.now()}-${crypto.randomUUID()}.json`), JSON.stringify({ profile: previous, actor: who.user, at: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
       const file = path.join(DATA_DIR, 'profiles.json'), tmp = `${file}.${process.pid}.tmp`;
       await fsp.writeFile(tmp, JSON.stringify({ ...doc, profiles: doc.profiles.map((profile) => profile.id === id ? next : profile) }, null, 2) + '\n');
       await fsp.rename(tmp, file);
       if (who.profileId === id) await community.finishSetup(who);
-    } catch (error) { await removeUnused(added); throw error; }
-    await removeUnused([{ src: previous.avatar, previewSrc: previous.avatarPreview }]);
-    return next;
-  });
+      await removeUnused([{ src: previous.avatar, previewSrc: previous.avatarPreview }]);
+      return next;
+    });
+  } catch (error) { await removeUnused(added); throw error; }
   return send(res, 200, editable(updated));
 }
 
@@ -304,17 +314,21 @@ async function archivePost(post, who, action) {
 async function createPost(req, res, who) {
   const input = await readForm(req);
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
-  const post = await withLock(async () => {
-    who = identity(req);
-    if (!who) fail(401, 'Not signed in.');
-    const doc = await readPosts();
-    const publishedAt = input.publishedAt || new Date().toISOString();
-    const media = await storeMedia(input, publishedAt);
-    const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
-    try { await writePosts({ ...doc, posts: [...doc.posts, post] }); }
-    catch (err) { await removeUnused(media, doc); throw err; }
-    return post;
-  });
+  const publishedAt = input.publishedAt || new Date().toISOString();
+  // Photo processing can take minutes for a large post. New files stay private
+  // until the post that references them is written, so do it before locking.
+  const media = await storeMedia(input, publishedAt);
+  let post;
+  try {
+    post = await withLock(async () => {
+      who = identity(req);
+      if (!who) fail(401, 'Not signed in.');
+      const doc = await readPosts();
+      const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
+      await writePosts({ ...doc, posts: [...doc.posts, post] });
+      return post;
+    });
+  } catch (err) { await removeUnused(media); throw err; }
   return send(res, 201, editable(post));
 }
 
@@ -385,32 +399,41 @@ async function publishAgent(input, who, key, dryRun) {
   } finally { agentPublishing = false; }
 }
 
+// Locate the post and check access, version, and photo selection. updatePost runs
+// this before processing new photos and again under the write lock, so a post that
+// changed in the meantime is still refused with 412.
+function planUpdate(req, doc, who, id, input) {
+  const index = doc.posts.findIndex((p) => p.id === id);
+  if (index < 0) fail(404, 'This post no longer exists.');
+  const previous = doc.posts[index];
+  requireEdit(who, previous);
+  checkVersion(req, previous);
+  const retained = input.retained === null ? (previous.media || []) : input.retained.map((src) => {
+    const item = (previous.media || []).find((m) => m.src === src);
+    if (!item) fail(400, 'A selected photo no longer belongs to this post.');
+    return item;
+  });
+  if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
+  if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
+  return { index, previous, retained, publishedAt: input.publishedAt || previous.publishedAt };
+}
+
 async function updatePost(req, res, who, id) {
   const input = await readForm(req);
-  const post = await withLock(async () => {
-    const doc = await readPosts();
-    const index = doc.posts.findIndex((p) => p.id === id);
-    if (index < 0) fail(404, 'This post no longer exists.');
-    const previous = doc.posts[index];
-    requireEdit(who, previous);
-    checkVersion(req, previous);
-    const retained = input.retained === null ? (previous.media || []) : input.retained.map((src) => {
-      const item = (previous.media || []).find((m) => m.src === src);
-      if (!item) fail(400, 'A selected photo no longer belongs to this post.');
-      return item;
-    });
-    if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
-    if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
-    const publishedAt = input.publishedAt || previous.publishedAt;
-    const added = await storeMedia(input, publishedAt);
-    const updated = { ...previous, text: input.text, milestone: input.milestone, publishedAt, media: [...retained, ...added], updatedAt: new Date(Math.max(Date.now(), (Date.parse(previous.updatedAt) || 0) + 1)).toISOString() };
-    try {
+  const { publishedAt } = planUpdate(req, await readPosts(), who, id, input);
+  const added = await storeMedia(input, publishedAt);
+  let post;
+  try {
+    post = await withLock(async () => {
+      const doc = await readPosts();
+      const { index, previous, retained } = planUpdate(req, doc, who, id, input);
+      const updated = { ...previous, text: input.text, milestone: input.milestone, publishedAt, media: [...retained, ...added], updatedAt: new Date(Math.max(Date.now(), (Date.parse(previous.updatedAt) || 0) + 1)).toISOString() };
       await archivePost(previous, who, 'edit');
       await writePosts({ ...doc, posts: doc.posts.map((p, i) => i === index ? updated : p) });
-    } catch (err) { await removeUnused(added, doc); throw err; }
-    await removeUnused(previous.media || []);
-    return updated;
-  });
+      await removeUnused(previous.media || []);
+      return updated;
+    });
+  } catch (err) { await removeUnused(added); throw err; }
   return send(res, 200, editable(post));
 }
 
