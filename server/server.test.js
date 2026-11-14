@@ -125,7 +125,8 @@ test('Admin is tied to his account identity on the session and future posts', as
   assert.equal(saved.status, 201);
   assert.equal(saved.body.author, 'Admin');
   assert.equal(saved.body.initials, 'A');
-  assert.equal(saved.body.authorId, 'admin-account');
+  const stored = JSON.parse(await fs.readFile(path.join(directory, 'data/posts.json'))).posts.find((post) => post.id === saved.body.id);
+  assert.equal(stored.authorId, 'admin-account'); assert.equal('authorId' in saved.body, false); assert.equal(saved.body.canEdit, true);
 });
 test('startup links account attribution once and preserves site customization', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-profile-tests-'));
@@ -170,7 +171,7 @@ test('edits preserve the original author and archive the previous text privately
     headers: { 'Remote-User': 'parent-b', 'Remote-Name': 'Parent B' } });
   assert.equal(response.status, 200);
   assert.equal(response.body.author, original.author);
-  assert.equal(response.body.authorId, original.authorId);
+  assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'data/posts.json'))).posts.find((post) => post.id === 'first').authorId, 'parent-a');
   assert.equal(response.body.publishedAt, original.publishedAt);
   assert.equal(response.body.media[0].src, shared);
   assert.notEqual(response.body.version, original.version);
@@ -212,6 +213,19 @@ test('photos can be added, retained, and removed without deleting media shared b
   await assert.rejects(fs.stat(path.join(directory, uploaded)), { code: 'ENOENT' });
   assert.equal((await fetch(base + '/' + shared)).status, 200);
 });
+test('photo descriptions are saved with new photos and can be changed on kept photos', async () => {
+  const created = await call('/api/posts', { method: 'POST', body: form({ files: [{}], meta: [{ alt: '  A blue-grey square  ' }] }) });
+  assert.equal(created.status, 201); assert.equal(created.body.media[0].alt, 'A blue-grey square');
+  const src = created.body.media[0].src;
+  const described = await call(`/api/posts/${created.body.id}`, { method: 'PUT', version: created.body.version, body: form({ retained: [{ src, alt: 'A small square in slate blue' }] }) });
+  assert.equal(described.status, 200); assert.equal(described.body.media[0].alt, 'A small square in slate blue'); assert.equal(described.body.media[0].src, src);
+  // Older clients send only the src and keep the existing description.
+  const kept = await call(`/api/posts/${created.body.id}`, { method: 'PUT', version: described.body.version, body: form({ retained: [src] }) });
+  assert.equal(kept.body.media[0].alt, 'A small square in slate blue');
+  for (const retained of [[{ src, alt: 7 }], [{ alt: 'no src' }], [src, { src }]]) {
+    assert.equal((await call(`/api/posts/${created.body.id}`, { method: 'PUT', version: kept.body.version, body: form({ retained }) })).status, 400);
+  }
+});
 test('deletion removes the post and its exclusive uploaded media from public access', async () => {
   const created = await call('/api/posts', { method: 'POST', body: form({ files: [{}] }) });
   assert.equal(created.status, 201);
@@ -224,6 +238,16 @@ test('deletion removes the post and its exclusive uploaded media from public acc
   assert.equal(published.posts.length, 2);
   await fs.writeFile(path.join(directory, 'media/2026/11/orphan.png'), png);
   assert.equal((await fetch(base + '/media/2026/11/orphan.png')).status, 404);
+});
+test('a photo stops being public as soon as posts.json no longer uses it, even after a same-size manual edit', async () => {
+  assert.equal((await fetch(base + '/' + shared)).status, 200); // Caches the reference check.
+  const file = path.join(directory, 'data/posts.json'), before = await fs.readFile(file, 'utf8');
+  const edited = before.replaceAll('shared.png', 'sharex.png');
+  assert.equal(edited.length, before.length);
+  await fs.writeFile(file, edited); // In place: same inode and size.
+  assert.equal((await fetch(base + '/' + shared)).status, 404);
+  await fs.writeFile(file, before);
+  assert.equal((await fetch(base + '/' + shared)).status, 200);
 });
 test('master and preview are public while referenced and are cleaned together on deletion', async () => {
   const data = await sharp({ create: { width: 1600, height: 900, channels: 3, background: '#667788' } }).png().toBuffer();

@@ -92,7 +92,8 @@ test('the combined Workspace/Agentglade role admits community members without gr
 test('all community members edit only their own posts/profile; only Admin edits others and agent posts', async () => {
   const guestMe = (await call('/api/me', { user: guest })).body;
   const own = (await post(guest)).body, admins = (await post(admin)).body, editors = (await post(editor)).body;
-  assert.equal(own.author, 'Taylor'); assert.equal(own.profileId, guestMe.profileId); assert.equal(own.authorId, guest);
+  assert.equal(own.author, 'Taylor'); assert.equal(own.profileId, guestMe.profileId); assert.equal('authorId' in own, false); assert.equal(own.canEdit, true);
+  assert.equal(JSON.parse(await fs.readFile(path.join(root, 'data/posts.json'))).posts.find((post) => post.id === own.id).authorId, guest);
   for (const user of [editor, guest]) {
     for (const target of [admins, user === editor ? own : editors]) {
       assert.equal((await edit('/api/posts/' + target.id, target, user, form())).status, 403);
@@ -109,6 +110,18 @@ test('all community members edit only their own posts/profile; only Admin edits 
   const data = list.find((p) => p.id === 'atlas'), body = new FormData(); body.set('name', 'Atlas'); body.set('bio', 'Admin can edit');
   assert.equal((await edit('/api/profiles/atlas', data, admin, body)).status, 200);
   assert.equal((await edit('/api/posts/' + own.id, updated.body, guest, undefined, 'DELETE')).status, 204);
+});
+test('post APIs never reveal account subjects and report edit rights for the viewer', async () => {
+  const own = (await post(guest)).body, admins = (await post(admin)).body;
+  const expect = { [guest]: { [own.id]: true, [admins.id]: false }, [editor]: { [own.id]: false, [admins.id]: false }, [admin]: { [own.id]: true, [admins.id]: true } };
+  for (const [user, rights] of Object.entries(expect)) {
+    const list = (await call('/api/posts', { user })).body.posts;
+    for (const [id, canEdit] of Object.entries(rights)) {
+      const listed = list.find((item) => item.id === id), single = (await call('/api/posts/' + id, { user })).body;
+      for (const view of [listed, single]) { assert.equal(view.canEdit, canEdit); assert.equal('authorId' in view, false); }
+      assert.equal(JSON.stringify(single).includes(guest) || JSON.stringify(single).includes(admin), false);
+    }
+  }
 });
 test('first login opens welcome; saving or skipping setup persists and cannot modify another account', async () => {
   const first = await call('/compose/', { user: guest }); assert.equal(first.status, 302); assert.equal(first.response.headers.get('location'), '/welcome/');

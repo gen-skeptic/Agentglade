@@ -107,6 +107,25 @@
     <div class="sheet-body" id="preview-body"></div>
   </dialog>
 
+  <dialog class="sheet" id="alt-dialog" aria-labelledby="alt-title">
+    <form id="alt-form">
+      <div class="sheet-bar">
+        <h2 class="compose-title" id="alt-title">Describe this photo</h2>
+        <button type="button" class="icon-button" data-close aria-label="Close without saving"><i data-icon="x"></i></button>
+      </div>
+      <div class="alt-body">
+        <img id="alt-preview" alt="" hidden>
+        <label class="alt-label" for="alt-text">Description <span><span id="alt-count">0</span>/300</span></label>
+        <textarea class="input" id="alt-text" rows="4" maxlength="300" placeholder="What does the photo show? Mention people, any text, and what matters for this post."></textarea>
+        <p class="compose-media-help">Screen readers read this aloud, and it appears if the photo cannot load.</p>
+        <div class="camera-actions">
+          <button type="button" class="button" data-close>Cancel</button>
+          <button type="submit" class="button button-primary">Save description</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
   <dialog class="sheet camera-sheet" id="camera-dialog" aria-labelledby="camera-title">
     <div class="sheet-bar">
       <h2 class="compose-title" id="camera-title">Take a photo</h2>

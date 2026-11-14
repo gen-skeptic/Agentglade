@@ -7,9 +7,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
+import crypto from 'node:crypto';
 
 const proxyKey = 'synthetic-test-proxy-key-not-for-deployments';
 let root, child, base, slowPhoto;
+const agentToken = 'agentglade_' + Buffer.alloc(32, 7).toString('base64url');
+const asAgent = (key) => ({ Authorization: `Bearer ${agentToken}`, 'Idempotency-Key': key, 'X-Forwarded-Host': 'feed.example.test' });
 const as = (user) => ({ 'X-Agentglade-Proxy-Key': proxyKey, 'Remote-User': user, 'Remote-Name': user });
 const timed = (started, promise) => promise.then(async (response) => ({ status: response.status, body: await response.json().catch(() => null), at: Date.now() - started }));
 function photoForm(text, files = []) {
@@ -24,8 +27,10 @@ before(async () => {
   await fs.writeFile(path.join(root, 'data/posts.json'), '{"posts":[]}');
   const authFile = path.join(root, 'auth.json');
   await fs.writeFile(authFile, JSON.stringify({ proxyTokenHash: hashSecret(proxyKey) }), { mode: 0o600 });
+  const agentFile = path.join(root, 'agents.json');
+  await fs.writeFile(agentFile, JSON.stringify({ agents: [{ id: 'atlas', profileId: 'atlas', tokenHash: crypto.createHash('sha256').update(agentToken).digest('hex') }] }), { mode: 0o600 });
   child = spawn(process.execPath, [new URL('./server.js', import.meta.url).pathname], { env: { ...process.env, NODE_ENV: 'production', PORT: '0',
-    AUTH_CONFIG_FILE: authFile, DATA_DIR: path.join(root, 'data'), MEDIA_DIR: path.join(root, 'media'),
+    AUTH_CONFIG_FILE: authFile, AGENT_KEYS_FILE: agentFile, PUBLIC_ORIGIN: 'https://feed.example.test', DATA_DIR: path.join(root, 'data'), MEDIA_DIR: path.join(root, 'media'),
     MEMBER_ACCOUNTS: JSON.stringify({ uploader: {}, reader: {} }), MEMBER_ADMINS: '[]' }, stdio: ['ignore', 'pipe', 'pipe'] });
   base = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Server did not start')), 10000);
@@ -70,4 +75,19 @@ test('a post edited while new photos are processing refuses the stale save and r
   assert.equal(saved.text, 'Newer text edit'); assert.deepEqual(saved.media, []);
   const files = (await fs.readdir(path.join(root, 'media'), { recursive: true })).filter((name) => name.endsWith('.webp'));
   assert.deepEqual(files, before.filter((name) => name.endsWith('.webp')));
+});
+
+test('an agent’s slow photo post does not hold up members, and its retry still replays', async () => {
+  const started = Date.now();
+  const agent = timed(started, fetch(base + '/api/agent/posts', { method: 'POST', headers: asAgent('slow-agent-photo-0001'), body: photoForm('An agent photo update', [slowPhoto]) }));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const text = timed(started, fetch(base + '/api/posts', { method: 'POST', headers: as('reader'), body: photoForm('Posted while the agent photo processes') }));
+  const results = { agent: await agent, text: await text };
+  assert.equal(results.agent.status, 201); assert.equal(results.text.status, 201);
+  assert.ok(results.text.at < results.agent.at, `the text post finished at ${results.text.at} ms, after the agent post at ${results.agent.at} ms`);
+  const retry = await fetch(base + '/api/agent/posts', { method: 'POST', headers: asAgent('slow-agent-photo-0001'), body: photoForm('An agent photo update', [slowPhoto]) });
+  const replay = await retry.json();
+  assert.equal(retry.status, 200); assert.equal(replay.replayed, true); assert.equal(replay.post.id, results.agent.body.post.id);
+  const stored = JSON.parse(await fs.readFile(path.join(root, 'data/posts.json'))).posts;
+  assert.equal(stored.filter((post) => post.text === 'An agent photo update').length, 1);
 });

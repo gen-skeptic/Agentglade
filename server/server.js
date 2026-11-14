@@ -24,7 +24,10 @@ const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
 const publicUrl = new URL(process.env.PUBLIC_ORIGIN || 'http://localhost:8080');
 if (!['http:', 'https:'].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash) throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or a path.');
 const PUBLIC_ORIGIN = publicUrl.origin;
-const humanAuth = await createHumanAuth({ configFile: process.env.AUTH_CONFIG_FILE, origin: PUBLIC_ORIGIN });
+let trustedProxies;
+try { trustedProxies = JSON.parse(process.env.TRUSTED_PROXIES || '[]'); }
+catch { throw new Error('TRUSTED_PROXIES must be a JSON array of IP addresses or CIDR ranges, such as ["10.0.0.0/8"].'); }
+const humanAuth = await createHumanAuth({ configFile: process.env.AUTH_CONFIG_FILE, origin: PUBLIC_ORIGIN, trustedProxies });
 // Optional proxy accounts bind exact stable subjects to public profiles.
 const MEMBER_ACCOUNTS = { ...(process.env.MEMBER_ACCOUNTS ? JSON.parse(process.env.MEMBER_ACCOUNTS) : {}), ...(humanAuth.localSubject ? { [humanAuth.localSubject]: humanAuth.localAccount } : {}) };
 if (MEMBER_ACCOUNTS !== null && (typeof MEMBER_ACCOUNTS !== 'object' || Array.isArray(MEMBER_ACCOUNTS)
@@ -114,6 +117,9 @@ class HttpError extends Error {
 const fail = (status, message) => { throw new HttpError(status, message); };
 const version = (post) => crypto.createHash('sha256').update(JSON.stringify(post)).digest('hex');
 const editable = (post) => ({ ...post, version: version(post) });
+// What a signed-in member sees: the stored author subject (an SSO account ID) stays
+// private, and the server says whether this viewer may edit or delete the post.
+const postView = (post, who) => { const { authorId, ...shown } = post; return { ...shown, version: version(post), canEdit: community.canEdit(who, post) }; };
 function checkVersion(req, post) {
   if (!req.headers['if-match']) fail(428, 'Reload this post before changing it.');
   if (req.headers['if-match'] !== `"${version(post)}"`) fail(412, 'This post changed in another window. Reload the latest post before saving or deleting.');
@@ -253,7 +259,13 @@ async function readForm(req) {
   try { meta = JSON.parse(field('mediaMeta') || '[]'); retained = form.has('retainMedia') ? JSON.parse(field('retainMedia')) : null; }
   catch { fail(400, 'Invalid media information.'); }
   if (!Array.isArray(meta) || meta.some((m) => !m || typeof m !== 'object' || Array.isArray(m))) fail(400, 'Invalid media information.');
-  if (retained !== null && (!Array.isArray(retained) || retained.some((src) => typeof src !== 'string') || new Set(retained).size !== retained.length)) fail(400, 'Invalid retained photos.');
+  // Kept photos are listed by src, optionally with an updated description: "src" or { src, alt }.
+  if (retained !== null) {
+    if (!Array.isArray(retained)) fail(400, 'Invalid retained photos.');
+    retained = retained.map((entry) => typeof entry === 'string' ? { src: entry } : entry);
+    if (retained.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.src !== 'string' || (entry.alt !== undefined && typeof entry.alt !== 'string'))
+      || new Set(retained.map((entry) => entry.src)).size !== retained.length) fail(400, 'Invalid retained photos.');
+  }
   const files = form.getAll('media').filter((f) => typeof f === 'object' && f.size > 0);
   if (files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
   for (const file of files) if (!EXT[file.type]) fail(415, `Unsupported file type: ${file.type || 'unknown'}.`);
@@ -277,6 +289,19 @@ async function mediaReferences(doc) {
   }
   return refs;
 }
+// Serving a photo checks that a post or profile still uses it. Re-reading and
+// parsing every JSON file per photo is slow for a large feed, so keep the set
+// until one of the files is replaced or modified. Writes replace files by
+// rename, which changes the inode, so a deletion takes effect on the next request.
+const REFERENCE_FILES = ['posts.json', 'site.json', 'profiles.json'];
+let referenceCache = { key: null, refs: null };
+async function servedMediaReferences() {
+  // Stat before reading: the set is never older than the key it is stored under.
+  const stats = await Promise.all(REFERENCE_FILES.map((name) => fsp.stat(path.join(DATA_DIR, name), { bigint: true })));
+  const key = stats.map((s) => `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`).join('|');
+  if (referenceCache.key !== key) referenceCache = { key, refs: await mediaReferences() };
+  return referenceCache.refs;
+}
 async function removeUnused(items, doc) {
   const refs = await mediaReferences(doc);
   for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc].filter(Boolean)))) {
@@ -297,7 +322,7 @@ async function storeMedia(input, publishedAt) {
       const name = `${prefix}-${i + 1}${photo ? '.webp' : EXT[file.type]}`;
       const src = `media/${sub}/${name}`;
       // Track each new file before writing, so partial writes are cleaned too.
-      media.push({ type: file.type.startsWith('video/') ? 'video' : 'image', src, alt: String(input.meta[i]?.alt || '').slice(0, 300) });
+      media.push({ type: file.type.startsWith('video/') ? 'video' : 'image', src, alt: String(input.meta[i]?.alt || '').trim().slice(0, 300) });
       if (photo) {
         const item = media.at(-1);
         Object.assign(item, { width: photo.width, height: photo.height });
@@ -339,7 +364,7 @@ async function createPost(req, res, who) {
       return post;
     });
   } catch (err) { await removeUnused(media); throw err; }
-  return send(res, 201, editable(post));
+  return send(res, 201, postView(post, who));
 }
 
 const agentRates = new Map();
@@ -351,61 +376,75 @@ async function writeAgentReceipt(file, receipt) {
 }
 async function publishAgent(input, who, key, dryRun) {
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
+  // One agent publication at a time in this process, so no other request can
+  // claim this idempotency key while its photos are processed below.
   if (agentPublishing) fail(429, 'Another agent post is processing. Retry with the same idempotency key.');
   agentPublishing = true;
   try {
-    return await withLock(async () => {
-      const requestHash = crypto.createHash('sha256').update(JSON.stringify({ text: input.text, milestone: input.milestone, publishedAt: input.publishedAt,
-        files: await Promise.all(input.files.map(async (file, i) => ({ type: file.type, alt: input.meta[i]?.alt || '', hash: crypto.createHash('sha256').update(Buffer.from(await file.arrayBuffer())).digest('hex') }))) })).digest('hex');
-      const directory = path.join(DATA_DIR, '.agent-receipts');
-      const keyHash = crypto.createHash('sha256').update(who.user + ':' + key).digest('hex');
-      const receiptPath = path.join(directory, keyHash + '.json');
-      const doc = await readPosts();
+    const requestHash = crypto.createHash('sha256').update(JSON.stringify({ text: input.text, milestone: input.milestone, publishedAt: input.publishedAt,
+      files: await Promise.all(input.files.map(async (file, i) => ({ type: file.type, alt: input.meta[i]?.alt || '', hash: crypto.createHash('sha256').update(Buffer.from(await file.arrayBuffer())).digest('hex') }))) })).digest('hex');
+    const directory = path.join(DATA_DIR, '.agent-receipts');
+    const keyHash = crypto.createHash('sha256').update(who.user + ':' + key).digest('hex');
+    const receiptPath = path.join(directory, keyHash + '.json');
+    // Answer a retry from its receipt. Called under the write lock.
+    const replay = async (doc) => {
       let receipt;
       try { receipt = JSON.parse(await fsp.readFile(receiptPath, 'utf8')); }
       catch (cause) { if (cause.code !== 'ENOENT') throw cause; }
-      if (receipt) {
-        if (receipt.requestHash !== requestHash) fail(409, 'This idempotency key was used for different content.');
-        const previous = doc.posts.find((post) => post.id === receipt.postId);
-        if (!previous) fail(receipt.state === 'committed' ? 410 : 409, receipt.state === 'committed' ? 'The original post was removed. It will not be recreated by a retry.' : 'The previous attempt is incomplete. Ask the owner to review it before changing the key.');
-        if (receipt.state !== 'committed') await writeAgentReceipt(receiptPath, { ...receipt, state: 'committed' });
-        return { post: editable(previous), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(previous.id)}`, replayed: true };
-      }
+      if (!receipt) return null;
+      if (receipt.requestHash !== requestHash) fail(409, 'This idempotency key was used for different content.');
+      const previous = doc.posts.find((post) => post.id === receipt.postId);
+      if (!previous) fail(receipt.state === 'committed' ? 410 : 409, receipt.state === 'committed' ? 'The original post was removed. It will not be recreated by a retry.' : 'The previous attempt is incomplete. Ask the owner to review it before changing the key.');
+      if (receipt.state !== 'committed') await writeAgentReceipt(receiptPath, { ...receipt, state: 'committed' });
+      return { post: editable(previous), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(previous.id)}`, replayed: true };
+    };
+    const admitted = await withLock(async () => {
+      const replayed = await replay(await readPosts());
+      if (replayed) return { replayed };
       const now = Date.now(), recent = agentRates.get(who.user);
       const rate = recent && now - recent.started < 3600000 ? recent : { started: now, creates: 0, attempts: 0, minute: now };
       if (now - rate.minute >= 60000) { rate.minute = now; rate.attempts = 0; }
       if (++rate.attempts > 12 || (!dryRun && rate.creates >= 12)) fail(429, 'Agent publication limit reached. Reuse the same key after the rate window resets.');
       agentRates.set(who.user, rate);
-      const author = await postAuthor(who);
-      if (dryRun) {
-        const photos = [];
-        for (const file of input.files) if (file.type.startsWith('image/')) {
-          const photo = await preparePhoto(file); photos.push({ width: photo.width, height: photo.height, format: 'webp' });
-        }
-        return { dryRun: true, author: author.author, profileId: author.profileId, photos, published: false };
-      }
-      const publishedAt = input.publishedAt || new Date().toISOString();
-      const media = await storeMedia(input, publishedAt);
-      const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...author, publishedAt,
-        milestone: input.milestone, text: input.text, media };
-      await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
-      const audit = path.join(DATA_DIR, '.agent-audit.jsonl');
-      const record = { at: new Date().toISOString(), action: 'publish', actor: who.user, keyHash, postId: post.id };
-      try {
-        await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
-        await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
-        await writePosts({ ...doc, posts: [...doc.posts, post] });
-      } catch (cause) {
-        await removeUnused(media, doc);
-        await fsp.unlink(receiptPath).catch(() => {});
-        throw cause;
-      }
-      rate.creates++;
-      // A crash here leaves a pending receipt plus a published post; retries find it.
-      await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'committed' });
-      await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'committed' }) + '\n', { mode: 0o600 });
-      return { post: editable(post), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(post.id)}`, replayed: false };
+      return { rate, author: await postAuthor(who) };
     });
+    if (admitted.replayed) return admitted.replayed;
+    const { rate, author } = admitted;
+    // Photo processing runs outside the write lock so members are not held up.
+    if (dryRun) {
+      const photos = [];
+      for (const file of input.files) if (file.type.startsWith('image/')) {
+        const photo = await preparePhoto(file); photos.push({ width: photo.width, height: photo.height, format: 'webp' });
+      }
+      return { dryRun: true, author: author.author, profileId: author.profileId, photos, published: false };
+    }
+    const publishedAt = input.publishedAt || new Date().toISOString();
+    const media = await storeMedia(input, publishedAt);
+    try {
+      return await withLock(async () => {
+        const doc = await readPosts();
+        const replayed = await replay(doc); // Cannot happen while agentPublishing is held; checked anyway.
+        if (replayed) { await removeUnused(media); return replayed; }
+        const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...author, publishedAt,
+          milestone: input.milestone, text: input.text, media };
+        await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+        const audit = path.join(DATA_DIR, '.agent-audit.jsonl');
+        const record = { at: new Date().toISOString(), action: 'publish', actor: who.user, keyHash, postId: post.id };
+        try {
+          await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
+          await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
+          await writePosts({ ...doc, posts: [...doc.posts, post] });
+        } catch (cause) {
+          await fsp.unlink(receiptPath).catch(() => {});
+          throw cause;
+        }
+        rate.creates++;
+        // A crash here leaves a pending receipt plus a published post; retries find it.
+        await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'committed' });
+        await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'committed' }) + '\n', { mode: 0o600 });
+        return { post: editable(post), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(post.id)}`, replayed: false };
+      });
+    } catch (cause) { await removeUnused(media); throw cause; }
   } finally { agentPublishing = false; }
 }
 
@@ -418,10 +457,10 @@ function planUpdate(req, doc, who, id, input) {
   const previous = doc.posts[index];
   requireEdit(who, previous);
   checkVersion(req, previous);
-  const retained = input.retained === null ? (previous.media || []) : input.retained.map((src) => {
+  const retained = input.retained === null ? (previous.media || []) : input.retained.map(({ src, alt }) => {
     const item = (previous.media || []).find((m) => m.src === src);
     if (!item) fail(400, 'A selected photo no longer belongs to this post.');
-    return item;
+    return alt === undefined ? item : { ...item, alt: alt.trim().slice(0, 300) };
   });
   if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
   if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
@@ -444,7 +483,7 @@ async function updatePost(req, res, who, id) {
       return updated;
     });
   } catch (err) { await removeUnused(added); throw err; }
-  return send(res, 200, editable(post));
+  return send(res, 200, postView(post, who));
 }
 
 async function deletePost(req, res, who, id) {
@@ -463,7 +502,7 @@ async function deletePost(req, res, who, id) {
   return send(res, 204, '');
 }
 
-function listPosts(doc, url) {
+function listPosts(doc, url, who) {
   let before;
   if (url.searchParams.has('before')) {
     try { before = JSON.parse(Buffer.from(url.searchParams.get('before'), 'base64url').toString()); }
@@ -475,7 +514,7 @@ function listPosts(doc, url) {
   const remaining = before ? posts.filter((p) => Date.parse(p.publishedAt) < before.time || (Date.parse(p.publishedAt) === before.time && p.id.localeCompare(before.id) < 0)) : posts;
   const page = remaining.slice(0, limit);
   const last = page.at(-1);
-  return { posts: page.map(editable), total: posts.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
+  return { posts: page.map((post) => postView(post, who)), total: posts.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
 }
 
 /* ---------- static files ---------- */
@@ -503,7 +542,7 @@ async function serveStatic(req, res, urlPath) {
   // Removed media must stop being public even if filesystem cleanup needs retrying.
   if (file.startsWith(MEDIA_DIR + path.sep)) {
     const src = 'media/' + path.relative(MEDIA_DIR, file).split(path.sep).join('/');
-    if (!(await mediaReferences()).has(src)) return send(res, 404, 'Not found');
+    if (!(await servedMediaReferences()).has(src)) return send(res, 404, 'Not found');
   }
   let stat;
   try {
@@ -573,7 +612,7 @@ const server = http.createServer(async (req, res) => {
       }
       const profileMatch = /^\/api\/profiles\/([a-z][a-z0-9-]{0,47})$/.exec(pathname);
       if (profileMatch && req.method === 'PUT') return await updateProfile(req, res, who, profileMatch[1]);
-      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(await readPosts(), url));
+      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(await readPosts(), url, who));
       if (pathname === '/api/posts' && req.method === 'POST') return await createPost(req, res, who);
       const match = /^\/api\/posts\/([^/]+)$/.exec(pathname);
       if (match) {
@@ -584,7 +623,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET') {
           const post = (await readPosts()).posts.find((p) => p.id === id);
           if (!post) fail(404, 'This post no longer exists.');
-          return send(res, 200, editable(post), { ETag: `"${version(post)}"` });
+          return send(res, 200, postView(post, who), { ETag: `"${version(post)}"` });
         }
       }
       return send(res, 404, { error: 'Not found.' });
