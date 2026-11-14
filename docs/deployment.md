@@ -7,6 +7,12 @@ protects individual writes; it is not a distributed database lock. Back up `/dat
 and `/media` together while the service is stopped or using a consistent volume
 snapshot. `/data` includes posts, profiles, private bindings, edit history,
 idempotency receipts, and audit records. `/media` contains processed uploads.
+Each post is its own file in `/data/posts/`, so saving one post never rewrites the
+others. The server holds the posts in memory while it runs: edit post files only
+while it is stopped. An installation from before this layout keeps its posts in
+`/data/posts.json`; the first start splits that file into `/data/posts/` and keeps
+the original as `/data/posts.json.migrated`, which you can delete once you have
+checked the result.
 Do not mount either data volume into another application writer.
 
 Seeds are copied only when the corresponding runtime file is absent. Stopping or

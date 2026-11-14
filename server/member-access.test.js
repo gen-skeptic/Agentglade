@@ -1,4 +1,5 @@
 import { hashSecret } from './auth.js';
+import { storedPosts, resetPosts } from './fixtures/posts.js';
 import test, { beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -23,7 +24,7 @@ async function start(extra = {}) {
     child.stdout.on('data', (data) => { const match = /listening on :(\d+)/.exec(data.toString()); if (match) { clearTimeout(timer); resolve(`http://127.0.0.1:${match[1]}`); } });
   });
 }
-beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-first-login-')); await fs.mkdir(path.join(root, 'data')); await fs.writeFile(path.join(root, 'data/posts.json'), '{"posts":[]}'); await start(); });
+beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-first-login-')); await fs.mkdir(path.join(root, 'data')); await start(); });
 afterEach(async () => { await stop(); await fs.rm(root, { recursive: true, force: true }); });
 async function call(route, { user = admin, role = user === admin ? 'Admin' : 'Agentglade Community', method = 'GET', json, body, headers = {} } = {}) {
   const response = await fetch(base + route, { method, body: json === undefined ? body : JSON.stringify(json), redirect: 'manual',
@@ -61,7 +62,7 @@ test('the community role is exact and required; names, email, generic Admin and 
 test('first login links legacy posts only by their exact author identity and preserves their content', async () => {
   const original = { id: 'legacy-grandma', author: 'Old name', authorId: guest, text: 'Keep this memory', publishedAt: '2026-11-12T12:00:00Z', media: [] };
   const unrelated = { ...original, id: 'different-account', authorId: other };
-  await fs.writeFile(path.join(root, 'data/posts.json'), JSON.stringify({ posts: [original, unrelated] }));
+  await stop(); await resetPosts(path.join(root, 'data'), { posts: [original, unrelated] }); await start();
   const me = (await call('/api/me', { user: guest })).body;
   const saved = (await call('/api/posts/' + original.id)).body;
   assert.equal(saved.profileId, me.profileId); assert.equal(saved.author, 'Taylor');
@@ -93,7 +94,7 @@ test('all community members edit only their own posts/profile; only Admin edits 
   const guestMe = (await call('/api/me', { user: guest })).body;
   const own = (await post(guest)).body, admins = (await post(admin)).body, editors = (await post(editor)).body;
   assert.equal(own.author, 'Taylor'); assert.equal(own.profileId, guestMe.profileId); assert.equal('authorId' in own, false); assert.equal(own.canEdit, true);
-  assert.equal(JSON.parse(await fs.readFile(path.join(root, 'data/posts.json'))).posts.find((post) => post.id === own.id).authorId, guest);
+  assert.equal((await storedPosts(path.join(root, 'data'))).get(own.id).authorId, guest);
   for (const user of [editor, guest]) {
     for (const target of [admins, user === editor ? own : editors]) {
       assert.equal((await edit('/api/posts/' + target.id, target, user, form())).status, 403);

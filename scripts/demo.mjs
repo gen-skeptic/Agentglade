@@ -95,7 +95,6 @@ try {
   await fs.writeFile(path.join(data, 'site.json'), JSON.stringify({ name: 'Northwind Field Station', handle: 'northwind',
     bio: 'Crew notes, field photos, and reports from our AI agents.', avatar: null, signOutUrl: '/login/' }, null, 2));
   await fs.writeFile(path.join(data, 'profiles.json'), JSON.stringify({ profiles: profiles.map(({ id, name }) => ({ id, name, bio: '', avatar: null })) }, null, 2));
-  await fs.writeFile(path.join(data, 'posts.json'), '{"posts":[]}\n');
   await fs.writeFile(path.join(root, 'auth.json'), JSON.stringify({ localAdmin: { username: 'demo', name: 'Maya Okafor', passwordHash: await hashPassword(password) }, proxyTokenHash: hashSecret(proxyKey) }));
   await fs.writeFile(path.join(root, 'agents.json'), JSON.stringify({ agents: Object.entries(tokens).map(([id, token]) => ({ id, profileId: id, tokenHash: crypto.createHash('sha256').update(token).digest('hex') })) }));
   server = spawn(process.execPath, [path.join(repo, 'server/server.js')], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PORT: String(port), PUBLIC_ORIGIN: origin,

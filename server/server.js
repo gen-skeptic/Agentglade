@@ -10,6 +10,7 @@ import { preparePhoto } from './photos.js';
 import { createAgentService } from './agents.js';
 import { createHumanAuth } from './auth.js';
 import { createMemberAccess } from './member-access.js';
+import { openPostStore } from './post-store.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = path.resolve(process.env.SITE_DIR || path.join(HERE, '..'));
@@ -119,6 +120,8 @@ const version = (post) => crypto.createHash('sha256').update(JSON.stringify(post
 const editable = (post) => ({ ...post, version: version(post) });
 // What a signed-in member sees: the stored author subject (an SSO account ID) stays
 // private, and the server says whether this viewer may edit or delete the post.
+// What anyone may see: a post without its author's private account subject.
+const publicView = ({ authorId, ...post }) => post;
 const postView = (post, who) => { const { authorId, ...shown } = post; return { ...shown, version: version(post), canEdit: community.canEdit(who, post) }; };
 function checkVersion(req, post) {
   if (!req.headers['if-match']) fail(428, 'Reload this post before changing it.');
@@ -129,7 +132,7 @@ function checkVersion(req, post) {
 async function seed() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
   await fsp.mkdir(MEDIA_DIR, { recursive: true });
-  for (const f of ['posts.json', 'site.json', 'profiles.json']) {
+  for (const f of ['site.json', 'profiles.json']) {
     const dest = path.join(DATA_DIR, f);
     if (!fs.existsSync(dest) && DATA_DIR !== SEED_DIR) await fsp.copyFile(path.join(SEED_DIR, f), dest);
   }
@@ -142,15 +145,13 @@ function withLock(fn) {
   return run;
 }
 
-async function readPosts() {
-  return JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'posts.json'), 'utf8'));
-}
-async function writePosts(doc) {
-  const file = path.join(DATA_DIR, 'posts.json');
-  const tmp = `${file}.${process.pid}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(doc, null, 2) + '\n');
-  await fsp.rename(tmp, file);
-}
+// Opened at startup, before the server listens.
+let posts;
+const newPostId = (publishedAt) => {
+  let id;
+  do id = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`; while (posts.has(id));
+  return id;
+};
 async function readProfiles() {
   return JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'profiles.json'), 'utf8'));
 }
@@ -203,23 +204,16 @@ async function updateProfile(req, res, who, id) {
 // Apply account display names to old posts as well as future publications.
 // Save each previous record with the same private history used for normal edits.
 async function migrateProfiles() {
-  const doc = await readPosts();
   const profiles = (await readProfiles()).profiles;
-  let changed = false;
-  for (const post of doc.posts) {
+  for (const post of [...posts.all()]) {
     if (post.profileId) continue;
     const configured = community.account(post.authorId);
     const profile = profiles.find((item) => item.id === configured?.profileId);
     const name = profile?.name || configured?.name;
     if (!name || (post.author === name && post.initials === initials(name) && (!profile || post.profileId === profile.id))) continue;
     await archivePost(post, { user: 'system' }, 'profile-name');
-    post.author = name;
-    post.initials = initials(name);
-    if (profile) post.profileId = profile.id;
-    changed = true;
+    await posts.put({ ...post, author: name, initials: initials(name), ...(profile ? { profileId: profile.id } : {}) });
   }
-  if (changed) await writePosts(doc);
-
 }
 
 /* ---------- post management ---------- */
@@ -278,9 +272,8 @@ function uploadedPath(src) {
   if (typeof src !== 'string' || !/^media\/\d{4}\/\d{2}\/[^/]+$/.test(src) || src.includes('..')) return null;
   return path.join(MEDIA_DIR, ...src.split('/').slice(1));
 }
-async function mediaReferences(doc) {
-  doc ||= await readPosts();
-  const refs = new Set(doc.posts.flatMap((post) => (post.media || []).flatMap((m) => [m.src, m.previewSrc].filter(Boolean))));
+async function mediaReferences() {
+  const refs = new Set(posts.all().flatMap((post) => (post.media || []).flatMap((m) => [m.src, m.previewSrc].filter(Boolean))));
   const site = JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'site.json'), 'utf8'));
   if (site.avatar) refs.add(site.avatar);
   for (const profile of (await readProfiles()).profiles) {
@@ -289,21 +282,21 @@ async function mediaReferences(doc) {
   }
   return refs;
 }
-// Serving a photo checks that a post or profile still uses it. Re-reading and
-// parsing every JSON file per photo is slow for a large feed, so keep the set
-// until one of the files is replaced or modified. Writes replace files by
-// rename, which changes the inode, so a deletion takes effect on the next request.
-const REFERENCE_FILES = ['posts.json', 'site.json', 'profiles.json'];
+// Serving a photo checks that a post or profile still uses it. Rebuilding that set
+// per photo is slow for a large feed, so keep it until a post changes or the site
+// or profiles file is replaced or modified. Writes replace files by rename, which
+// changes the inode, so a deletion takes effect on the next request.
+const REFERENCE_FILES = ['site.json', 'profiles.json'];
 let referenceCache = { key: null, refs: null };
 async function servedMediaReferences() {
-  // Stat before reading: the set is never older than the key it is stored under.
+  // Key before reading: the set is never older than the key it is stored under.
   const stats = await Promise.all(REFERENCE_FILES.map((name) => fsp.stat(path.join(DATA_DIR, name), { bigint: true })));
-  const key = stats.map((s) => `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`).join('|');
+  const key = [posts.generation, ...stats.map((s) => `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`)].join('|');
   if (referenceCache.key !== key) referenceCache = { key, refs: await mediaReferences() };
   return referenceCache.refs;
 }
-async function removeUnused(items, doc) {
-  const refs = await mediaReferences(doc);
+async function removeUnused(items) {
+  const refs = await mediaReferences();
   for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc].filter(Boolean)))) {
     const file = uploadedPath(src);
     if (!file || refs.has(src)) continue;
@@ -358,9 +351,8 @@ async function createPost(req, res, who) {
     post = await withLock(async () => {
       who = identity(req);
       if (!who) fail(401, 'Not signed in.');
-      const doc = await readPosts();
-      const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
-      await writePosts({ ...doc, posts: [...doc.posts, post] });
+      const post = { id: newPostId(publishedAt), ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
+      await posts.put(post);
       return post;
     });
   } catch (err) { await removeUnused(media); throw err; }
@@ -387,19 +379,19 @@ async function publishAgent(input, who, key, dryRun) {
     const keyHash = crypto.createHash('sha256').update(who.user + ':' + key).digest('hex');
     const receiptPath = path.join(directory, keyHash + '.json');
     // Answer a retry from its receipt. Called under the write lock.
-    const replay = async (doc) => {
+    const replay = async () => {
       let receipt;
       try { receipt = JSON.parse(await fsp.readFile(receiptPath, 'utf8')); }
       catch (cause) { if (cause.code !== 'ENOENT') throw cause; }
       if (!receipt) return null;
       if (receipt.requestHash !== requestHash) fail(409, 'This idempotency key was used for different content.');
-      const previous = doc.posts.find((post) => post.id === receipt.postId);
+      const previous = posts.get(receipt.postId);
       if (!previous) fail(receipt.state === 'committed' ? 410 : 409, receipt.state === 'committed' ? 'The original post was removed. It will not be recreated by a retry.' : 'The previous attempt is incomplete. Ask the owner to review it before changing the key.');
       if (receipt.state !== 'committed') await writeAgentReceipt(receiptPath, { ...receipt, state: 'committed' });
       return { post: editable(previous), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(previous.id)}`, replayed: true };
     };
     const admitted = await withLock(async () => {
-      const replayed = await replay(await readPosts());
+      const replayed = await replay();
       if (replayed) return { replayed };
       const now = Date.now(), recent = agentRates.get(who.user);
       const rate = recent && now - recent.started < 3600000 ? recent : { started: now, creates: 0, attempts: 0, minute: now };
@@ -422,10 +414,9 @@ async function publishAgent(input, who, key, dryRun) {
     const media = await storeMedia(input, publishedAt);
     try {
       return await withLock(async () => {
-        const doc = await readPosts();
-        const replayed = await replay(doc); // Cannot happen while agentPublishing is held; checked anyway.
+        const replayed = await replay(); // Cannot happen while agentPublishing is held; checked anyway.
         if (replayed) { await removeUnused(media); return replayed; }
-        const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...author, publishedAt,
+        const post = { id: newPostId(publishedAt), ...author, publishedAt,
           milestone: input.milestone, text: input.text, media };
         await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
         const audit = path.join(DATA_DIR, '.agent-audit.jsonl');
@@ -433,7 +424,7 @@ async function publishAgent(input, who, key, dryRun) {
         try {
           await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
           await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
-          await writePosts({ ...doc, posts: [...doc.posts, post] });
+          await posts.put(post);
         } catch (cause) {
           await fsp.unlink(receiptPath).catch(() => {});
           throw cause;
@@ -451,10 +442,9 @@ async function publishAgent(input, who, key, dryRun) {
 // Locate the post and check access, version, and photo selection. updatePost runs
 // this before processing new photos and again under the write lock, so a post that
 // changed in the meantime is still refused with 412.
-function planUpdate(req, doc, who, id, input) {
-  const index = doc.posts.findIndex((p) => p.id === id);
-  if (index < 0) fail(404, 'This post no longer exists.');
-  const previous = doc.posts[index];
+function planUpdate(req, who, id, input) {
+  const previous = posts.get(id);
+  if (!previous) fail(404, 'This post no longer exists.');
   requireEdit(who, previous);
   checkVersion(req, previous);
   const retained = input.retained === null ? (previous.media || []) : input.retained.map(({ src, alt }) => {
@@ -464,21 +454,20 @@ function planUpdate(req, doc, who, id, input) {
   });
   if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
   if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
-  return { index, previous, retained, publishedAt: input.publishedAt || previous.publishedAt };
+  return { previous, retained, publishedAt: input.publishedAt || previous.publishedAt };
 }
 
 async function updatePost(req, res, who, id) {
   const input = await readForm(req);
-  const { publishedAt } = planUpdate(req, await readPosts(), who, id, input);
+  const { publishedAt } = planUpdate(req, who, id, input);
   const added = await storeMedia(input, publishedAt);
   let post;
   try {
     post = await withLock(async () => {
-      const doc = await readPosts();
-      const { index, previous, retained } = planUpdate(req, doc, who, id, input);
+      const { previous, retained } = planUpdate(req, who, id, input);
       const updated = { ...previous, text: input.text, milestone: input.milestone, publishedAt, media: [...retained, ...added], updatedAt: new Date(Math.max(Date.now(), (Date.parse(previous.updatedAt) || 0) + 1)).toISOString() };
       await archivePost(previous, who, 'edit');
-      await writePosts({ ...doc, posts: doc.posts.map((p, i) => i === index ? updated : p) });
+      await posts.put(updated);
       await removeUnused(previous.media || []);
       return updated;
     });
@@ -489,20 +478,19 @@ async function updatePost(req, res, who, id) {
 async function deletePost(req, res, who, id) {
   if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
   await withLock(async () => {
-    const doc = await readPosts();
-    const previous = doc.posts.find((p) => p.id === id);
+    const previous = posts.get(id);
     if (!previous) fail(404, 'This post no longer exists.');
     requireEdit(who, previous);
     checkVersion(req, previous);
     await archivePost(previous, who, 'delete');
-    const updated = { ...doc, posts: doc.posts.filter((p) => p.id !== id) };
-    await writePosts(updated);
-    await removeUnused(previous.media || [], updated);
+    await posts.remove(id);
+    await removeUnused(previous.media || []);
   });
   return send(res, 204, '');
 }
 
-function listPosts(doc, url, who) {
+// One page of posts (already sorted newest first), shown through view(post).
+function listPosts(sorted, url, view) {
   let before;
   if (url.searchParams.has('before')) {
     try { before = JSON.parse(Buffer.from(url.searchParams.get('before'), 'base64url').toString()); }
@@ -510,11 +498,10 @@ function listPosts(doc, url, who) {
     if (!before || typeof before.id !== 'string' || !Number.isFinite(before.time)) fail(400, 'Invalid page. Refresh the post list.');
   }
   const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 20));
-  const posts = doc.posts.slice().sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt) || b.id.localeCompare(a.id));
-  const remaining = before ? posts.filter((p) => Date.parse(p.publishedAt) < before.time || (Date.parse(p.publishedAt) === before.time && p.id.localeCompare(before.id) < 0)) : posts;
+  const remaining = before ? sorted.filter((p) => Date.parse(p.publishedAt) < before.time || (Date.parse(p.publishedAt) === before.time && p.id.localeCompare(before.id) < 0)) : sorted;
   const page = remaining.slice(0, limit);
   const last = page.at(-1);
-  return { posts: page.map((post) => postView(post, who)), total: posts.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
+  return { posts: page.map(view), total: sorted.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
 }
 
 /* ---------- static files ---------- */
@@ -535,10 +522,7 @@ async function serveStatic(req, res, urlPath) {
   let file = resolveStatic(urlPath);
   if (!file) return send(res, 404, 'Not found');
   // Filter by resolved file so encoded paths cannot expose private account subjects.
-  if (file === path.join(DATA_DIR, 'posts.json')) {
-    const doc = await readPosts();
-    return send(res, 200, { posts: doc.posts.map(({ authorId, ...post }) => post) });
-  }
+  if (file === path.join(DATA_DIR, 'posts.json')) return send(res, 200, { posts: posts.all().map(publicView) });
   // Removed media must stop being public even if filesystem cleanup needs retrying.
   if (file.startsWith(MEDIA_DIR + path.sep)) {
     const src = 'media/' + path.relative(MEDIA_DIR, file).split(path.sep).join('/');
@@ -612,7 +596,7 @@ const server = http.createServer(async (req, res) => {
       }
       const profileMatch = /^\/api\/profiles\/([a-z][a-z0-9-]{0,47})$/.exec(pathname);
       if (profileMatch && req.method === 'PUT') return await updateProfile(req, res, who, profileMatch[1]);
-      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(await readPosts(), url, who));
+      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(posts.all(), url, (post) => postView(post, who)));
       if (pathname === '/api/posts' && req.method === 'POST') return await createPost(req, res, who);
       const match = /^\/api\/posts\/([^/]+)$/.exec(pathname);
       if (match) {
@@ -621,7 +605,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'PUT') return await updatePost(req, res, who, id);
         if (req.method === 'DELETE') return await deletePost(req, res, who, id);
         if (req.method === 'GET') {
-          const post = (await readPosts()).posts.find((p) => p.id === id);
+          const post = posts.get(id);
           if (!post) fail(404, 'This post no longer exists.');
           return send(res, 200, postView(post, who), { ETag: `"${version(post)}"` });
         }
@@ -647,6 +631,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 await seed();
+posts = await openPostStore(DATA_DIR);
 await community.initialize();
 await migrateProfiles();
 server.listen(PORT, () => console.log(`agentglade listening on :${server.address().port} (data ${DATA_DIR}, media ${MEDIA_DIR})`));

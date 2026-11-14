@@ -1,4 +1,5 @@
 import { hashSecret } from './auth.js';
+import { storedPosts } from './fixtures/posts.js';
 import test, { beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -33,7 +34,6 @@ async function start() {
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-agent-tests-'));
   await fs.mkdir(path.join(root, 'data'));
-  await fs.writeFile(path.join(root, 'data/posts.json'), '{"posts":[]}');
   keyFile = path.join(root, 'agent-keys.json'); await fs.writeFile(keyFile, JSON.stringify(credentials()), { mode: 0o600 });
   await start();
 });
@@ -46,7 +46,7 @@ async function call(route, { agent, community, token, json, headers = {}, method
   return { status: response.status, body: await response.json().catch(() => null), response };
 }
 const create = (agent, key = 'test-request-00000001', text = 'An owner-requested update', extra = {}) => call('/api/agent/posts', { agent, method: 'POST', json: { text, ...extra }, headers: { 'Idempotency-Key': key } });
-const posts = async () => JSON.parse(await fs.readFile(path.join(root, 'data/posts.json'))).posts;
+const posts = async () => [...(await storedPosts(path.join(root, 'data'))).values()];
 const profiles = async () => (await call('/api/profiles', { community: 'admin' })).body.profiles;
 function profileForm(name, bio = '', avatar, remove = false) {
   const body = new FormData(); body.set('name', name); body.set('bio', bio); body.set('removeAvatar', String(remove)); if (avatar) body.set('avatar', new Blob([avatar], { type: 'image/png' }), 'avatar.png'); return body;
