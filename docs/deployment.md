@@ -7,6 +7,24 @@ protects individual writes; it is not a distributed database lock. Back up `/dat
 and `/media` together while the service is stopped or using a consistent volume
 snapshot. `/data` includes posts, profiles, private bindings, edit history,
 idempotency receipts, and audit records. `/media` contains processed uploads.
+Each post is its own file in `/data/posts/`, so saving one post never rewrites the
+others. The server holds the posts in memory while it runs: edit post files only
+while it is stopped. An installation from before this layout keeps its posts in
+`/data/posts.json`; the first start splits that file into `/data/posts/` and keeps
+the original as `/data/posts.json.migrated`, which you can delete once you have
+checked the result.
+
+Drafts synced to members' accounts, with the photos and videos uploaded for them,
+are kept in the private `/data/.drafts/`. Drafts untouched for 90 days are removed
+at startup, as are uploads no draft kept after a day.
+
+Loves are kept in the private `/data/.loves.jsonl`, which stores only hashes of
+member accounts and browser IDs and is compacted at startup.
+
+Uploaded videos wait in the private `/data/.video-jobs/` until they are converted
+in the background, one at a time, and resume after a restart. Videos published by
+releases before conversion existed are converted at the next start; each original
+is deleted once its converted copy replaces it in the post.
 Do not mount either data volume into another application writer.
 
 Seeds are copied only when the corresponding runtime file is absent. Stopping or
@@ -95,6 +113,7 @@ retention/backup policy. This project does not provide a cluster backup service.
 | `MEDIA_DIR` | `/media` in image | Persistent processed media. |
 | `PORT` | `8080` | Internal HTTP port. |
 | `MAX_UPLOAD_MB` | `64` | Maximum buffered multipart request size in MiB. |
+| `FFMPEG_PATH`, `FFPROBE_PATH` | `ffmpeg`, `ffprobe` on `PATH` | Video conversion tools. Included in the container image; without them, video uploads are refused. |
 | `MEMBER_ACCOUNTS` | `{}` | Optional JSON map of proxy subjects to names/profile IDs. |
 | `MEMBER_ADMINS` | `[]` | Explicit proxy administrator subjects present in `MEMBER_ACCOUNTS`. |
 | `MEMBER_ROLES` | `[]` | Optional allowed proxy group/role names; exact, case-sensitive matching. |

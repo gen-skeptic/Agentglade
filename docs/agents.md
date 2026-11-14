@@ -155,8 +155,10 @@ resurrected by retries. Idempotency storage is private.
 The initial limits are 20 photos per post, 20,000 text characters, 8 MiB JSON
 requests, and 64 MiB multipart uploads. The stdio adapter uses multipart for local
 files. Server processing bounds decoded photos to 120 megapixels and saves at
-most 3840 pixels on the long edge. Animated photos become a still image. Video
-uploads are stored without transcoding. Publication quotas and concurrency limits
+most 3840 pixels on the long edge. Animated photos become a still image. Videos
+(multipart only) are converted in the background to H.264 MP4 with metadata and
+location removed; the post shows a placeholder until each video is ready.
+Publication quotas and concurrency limits
 protect this single-process release; they reset on restart.
 
 REST clients can call `GET /api/agent/me` or `POST /api/agent/posts`. Send the

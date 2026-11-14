@@ -1,4 +1,5 @@
 import { hashSecret } from './auth.js';
+import { storedPosts, resetPosts } from './fixtures/posts.js';
 import test, { before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -47,15 +48,18 @@ async function stopServer(process) {
 }
 before(async () => {
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-post-tests-'));
-  ({ child, base } = await startServer(directory));
+  await fs.mkdir(path.join(directory, 'data'));
 });
+// Posts are served from memory, so every test starts the server on a fresh fixture.
 beforeEach(async () => {
-  await fs.writeFile(path.join(directory, 'data/posts.json'), JSON.stringify(fixture()));
+  await stopServer(child);
+  await resetPosts(path.join(directory, 'data'), fixture());
   await fs.writeFile(path.join(directory, 'data/site.json'), JSON.stringify({ name: 'Agentglade' }));
   await fs.rm(path.join(directory, 'media'), { recursive: true, force: true });
   await fs.mkdir(path.join(directory, 'media/2026/11'), { recursive: true });
   await fs.writeFile(path.join(directory, shared), png);
   await fs.rm(path.join(directory, 'data/.history'), { recursive: true, force: true });
+  ({ child, base } = await startServer(directory));
 });
 after(async () => {
   await stopServer(child);
@@ -125,7 +129,7 @@ test('Admin is tied to his account identity on the session and future posts', as
   assert.equal(saved.status, 201);
   assert.equal(saved.body.author, 'Admin');
   assert.equal(saved.body.initials, 'A');
-  const stored = JSON.parse(await fs.readFile(path.join(directory, 'data/posts.json'))).posts.find((post) => post.id === saved.body.id);
+  const stored = (await storedPosts(path.join(directory, 'data'))).get(saved.body.id);
   assert.equal(stored.authorId, 'admin-account'); assert.equal('authorId' in saved.body, false); assert.equal(saved.body.canEdit, true);
 });
 test('startup links account attribution once and preserves site customization', async () => {
@@ -140,9 +144,9 @@ test('startup links account attribution once and preserves site customization', 
     await fs.writeFile(path.join(root, 'data/site.json'), JSON.stringify({ name: 'Agentglade', bio: 'Daily notes and photos for community. Placeholder bio: edit data/site.json.' }));
     for (let attempt = 0; attempt < 2; attempt++) {
       process = (await startServer(root)).child;
-      const doc = JSON.parse(await fs.readFile(path.join(root, 'data/posts.json')));
-      assert.deepEqual(doc.posts[0], { ...original.posts[0], author: 'Admin', initials: 'A' });
-      assert.deepEqual(doc.posts[1], original.posts[1]);
+      const stored = await storedPosts(path.join(root, 'data'));
+      assert.deepEqual(stored.get('first'), { ...original.posts[0], author: 'Admin', initials: 'A' });
+      assert.deepEqual(stored.get('second'), original.posts[1]);
       assert.equal(JSON.parse(await fs.readFile(path.join(root, 'data/site.json'))).bio, 'Daily notes and photos for community. Placeholder bio: edit data/site.json.');
       const archives = await fs.readdir(path.join(root, 'data/.history'));
       assert.equal(archives.length, 1);
@@ -171,7 +175,7 @@ test('edits preserve the original author and archive the previous text privately
     headers: { 'Remote-User': 'parent-b', 'Remote-Name': 'Parent B' } });
   assert.equal(response.status, 200);
   assert.equal(response.body.author, original.author);
-  assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'data/posts.json'))).posts.find((post) => post.id === 'first').authorId, 'parent-a');
+  assert.equal((await storedPosts(path.join(directory, 'data'))).get('first').authorId, 'parent-a');
   assert.equal(response.body.publishedAt, original.publishedAt);
   assert.equal(response.body.media[0].src, shared);
   assert.notEqual(response.body.version, original.version);
@@ -239,15 +243,28 @@ test('deletion removes the post and its exclusive uploaded media from public acc
   await fs.writeFile(path.join(directory, 'media/2026/11/orphan.png'), png);
   assert.equal((await fetch(base + '/media/2026/11/orphan.png')).status, 404);
 });
-test('a photo stops being public as soon as posts.json no longer uses it, even after a same-size manual edit', async () => {
-  assert.equal((await fetch(base + '/' + shared)).status, 200); // Caches the reference check.
-  const file = path.join(directory, 'data/posts.json'), before = await fs.readFile(file, 'utf8');
-  const edited = before.replaceAll('shared.png', 'sharex.png');
-  assert.equal(edited.length, before.length);
-  await fs.writeFile(file, edited); // In place: same inode and size.
-  assert.equal((await fetch(base + '/' + shared)).status, 404);
-  await fs.writeFile(file, before);
-  assert.equal((await fetch(base + '/' + shared)).status, 200);
+test('a photo used only by site.json follows that file, even after a same-size manual edit', async () => {
+  await fs.writeFile(path.join(directory, 'media/2026/11/banner.png'), png);
+  const file = path.join(directory, 'data/site.json');
+  assert.equal((await fetch(base + '/media/2026/11/banner.png')).status, 404); // Caches the reference check.
+  await fs.writeFile(file, JSON.stringify({ name: 'Agentglade', avatar: 'media/2026/11/banner.png' }));
+  assert.equal((await fetch(base + '/media/2026/11/banner.png')).status, 200);
+  await fs.writeFile(file, JSON.stringify({ name: 'Agentglade', avatar: 'media/2026/11/bannex.png' })); // In place, same size.
+  assert.equal((await fetch(base + '/media/2026/11/banner.png')).status, 404);
+});
+test('saving a post writes only that post, and existing posts.json data migrates once', async () => {
+  const data = path.join(directory, 'data');
+  assert.deepEqual([...(await storedPosts(data)).keys()].sort(), ['first', 'second']);
+  assert.equal(JSON.parse(await fs.readFile(path.join(data, 'posts.json.migrated'))).posts.length, 2);
+  await assert.rejects(fs.stat(path.join(data, 'posts.json')), { code: 'ENOENT' });
+  const untouched = (await fs.stat(path.join(data, 'posts/second.json'))).mtimeMs;
+  const original = await read();
+  assert.equal((await call('/api/posts/first', { method: 'PUT', version: original.version, body: form({ text: 'Only this file changes' }) })).status, 200);
+  assert.equal((await fs.stat(path.join(data, 'posts/second.json'))).mtimeMs, untouched);
+  assert.equal((await storedPosts(data)).get('first').text, 'Only this file changes');
+  // A restart reads the files, not the old posts.json.
+  await stopServer(child); ({ child, base } = await startServer(directory));
+  assert.equal((await read()).text, 'Only this file changes');
 });
 test('master and preview are public while referenced and are cleaned together on deletion', async () => {
   const data = await sharp({ create: { width: 1600, height: 900, channels: 3, background: '#667788' } }).png().toBuffer();
@@ -298,6 +315,30 @@ test('an unparseable upload limit stops startup instead of disabling the limit',
       await assert.rejects(startServer(root, { MAX_UPLOAD_MB: value }).then(({ child: started }) => stopServer(started)), /MAX_UPLOAD_MB must be a positive number/);
     }
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+test('the public feed pages through posts with filters, a summary, and permalinks, without account subjects', async () => {
+  const milestone = (await call('/api/posts', { method: 'POST', body: form({ text: 'A milestone', milestone: 'First steps', publishedAt: '2026-11-13T12:00:00.000Z' }) })).body;
+  const admin = (await call('/api/posts', { method: 'POST', headers: { 'Remote-User': 'admin-account' }, body: form({ text: 'Admin note', publishedAt: '2026-11-14T12:00:00.000Z' }) })).body;
+  const anonymous = async (route, options) => { const response = await globalThis.fetch(base + route, options); return { status: response.status, body: await response.json().catch(() => null) }; };
+  const ids = (page) => page.body.posts.map((post) => post.id);
+  const first = await anonymous('/api/feed?limit=2');
+  assert.equal(first.status, 200); assert.deepEqual(ids(first), [admin.id, milestone.id]); assert.equal(first.body.total, 4);
+  const second = await anonymous('/api/feed?limit=2&before=' + encodeURIComponent(first.body.nextCursor));
+  assert.deepEqual(ids(second), ['second', 'first']); assert.equal(second.body.nextCursor, null);
+  assert.deepEqual(ids(await anonymous('/api/feed?filter=photos')), ['second', 'first']);
+  assert.deepEqual(ids(await anonymous('/api/feed?filter=milestones')), [milestone.id]);
+  assert.deepEqual(ids(await anonymous('/api/feed?profile=' + admin.profileId)), [admin.id]);
+  const summary = (await anonymous('/api/feed/summary')).body;
+  assert.deepEqual(summary.counts, { all: 4, photos: 2, milestones: 1 });
+  assert.deepEqual(summary.recentPhotos.map((photo) => [photo.postId, photo.index, photo.src]), [['second', 0, shared], ['first', 0, shared]]);
+  assert.deepEqual(summary.milestones, [{ postId: milestone.id, milestone: 'First steps', publishedAt: '2026-11-13T12:00:00.000Z' }]);
+  assert.deepEqual((await anonymous('/api/feed/summary?profile=' + admin.profileId)).body.counts, { all: 1, photos: 0, milestones: 0 });
+  const single = await anonymous('/api/feed/posts/first');
+  assert.equal(single.status, 200); assert.equal(single.body.text, 'Original first');
+  for (const body of [first.body, second.body, single.body, summary]) assert.equal(JSON.stringify(body).includes('parent-a') || JSON.stringify(body).includes('admin-account'), false);
+  assert.equal((await anonymous('/api/feed/posts/missing')).status, 404);
+  for (const route of ['/api/feed?filter=secret', '/api/feed?profile=../x', '/api/feed?before=nonsense']) assert.equal((await anonymous(route)).status, 400);
+  assert.equal((await anonymous('/api/feed', { method: 'POST' })).status, 405);
 });
 test('stable pagination continues even when the cursor post is deleted', async () => {
   const page = await call('/api/posts?limit=1');

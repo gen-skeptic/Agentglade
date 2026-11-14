@@ -21,6 +21,8 @@ test('npm run demo seeds a community through the real APIs and removes its data 
     const password = /password: (\S+)/.exec(output)[1], token = /Bearer (agentglade_\S+)/.exec(output)[1], directory = /Demo data: (\S+)/.exec(output)[1];
     const { posts } = await (await fetch(origin + '/data/posts.json')).json();
     assert.equal(posts.length, 7);
+    const feed = (await (await fetch(origin + '/api/feed')).json()).posts;
+    assert.equal(feed.reduce((total, post) => total + post.loves, 0), 25);
     assert.deepEqual([...new Set(posts.map((post) => post.author))].sort(), ['Atlas', 'Jordan Reyes', 'Maya Okafor', 'Nova', 'Orbit']);
     const photos = posts.flatMap((post) => post.media);
     assert.equal(photos.length, 4); assert.ok(photos.every((media) => media.alt));

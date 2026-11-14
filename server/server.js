@@ -10,6 +10,10 @@ import { preparePhoto } from './photos.js';
 import { createAgentService } from './agents.js';
 import { createHumanAuth } from './auth.js';
 import { createMemberAccess } from './member-access.js';
+import { openPostStore } from './post-store.js';
+import { createVideoProcessor, sniffVideo } from './videos.js';
+import { openLoveStore, memberKey, visitorKey } from './loves.js';
+import { openDraftStore, draftScope } from './drafts.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = path.resolve(process.env.SITE_DIR || path.join(HERE, '..'));
@@ -89,13 +93,13 @@ async function ensureIdentity(req) {
 function requireEdit(who, item, kind) {
   if (!community.canEdit(who, item, kind)) fail(403, 'You can only edit your own posts and profile.');
 }
-async function readJSON(req) {
+async function readJSON(req, limit = 16384) {
   if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
   if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) fail(415, 'Expected JSON.');
   const chunks = []; let size = 0;
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     size += chunk.length;
-    if (size > 16384) { req.resume(); fail(413, 'Request too large.'); }
+    if (size > limit) { req.resume(); fail(413, 'Request too large.'); }
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { fail(400, 'Invalid JSON.'); }
@@ -119,6 +123,8 @@ const version = (post) => crypto.createHash('sha256').update(JSON.stringify(post
 const editable = (post) => ({ ...post, version: version(post) });
 // What a signed-in member sees: the stored author subject (an SSO account ID) stays
 // private, and the server says whether this viewer may edit or delete the post.
+// What anyone may see: a post without its author's private account subject.
+const publicView = ({ authorId, ...post }) => post;
 const postView = (post, who) => { const { authorId, ...shown } = post; return { ...shown, version: version(post), canEdit: community.canEdit(who, post) }; };
 function checkVersion(req, post) {
   if (!req.headers['if-match']) fail(428, 'Reload this post before changing it.');
@@ -129,7 +135,7 @@ function checkVersion(req, post) {
 async function seed() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
   await fsp.mkdir(MEDIA_DIR, { recursive: true });
-  for (const f of ['posts.json', 'site.json', 'profiles.json']) {
+  for (const f of ['site.json', 'profiles.json']) {
     const dest = path.join(DATA_DIR, f);
     if (!fs.existsSync(dest) && DATA_DIR !== SEED_DIR) await fsp.copyFile(path.join(SEED_DIR, f), dest);
   }
@@ -142,15 +148,13 @@ function withLock(fn) {
   return run;
 }
 
-async function readPosts() {
-  return JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'posts.json'), 'utf8'));
-}
-async function writePosts(doc) {
-  const file = path.join(DATA_DIR, 'posts.json');
-  const tmp = `${file}.${process.pid}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(doc, null, 2) + '\n');
-  await fsp.rename(tmp, file);
-}
+// Opened at startup, before the server listens.
+let posts, videos, loves, drafts;
+const newPostId = (publishedAt) => {
+  let id;
+  do id = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`; while (posts.has(id));
+  return id;
+};
 async function readProfiles() {
   return JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'profiles.json'), 'utf8'));
 }
@@ -179,7 +183,7 @@ async function updateProfile(req, res, who, id) {
   // Check access before spending time on the photo, then process it outside the
   // write lock. The checks run again under the lock in case the profile changed.
   editableProfile(await readProfiles());
-  const added = avatar?.size ? await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString()) : [];
+  const added = avatar?.size ? (await storeMedia({ files: [avatar], meta: [] }, new Date().toISOString())).media : [];
   let updated;
   try {
     updated = await withLock(async () => {
@@ -203,23 +207,16 @@ async function updateProfile(req, res, who, id) {
 // Apply account display names to old posts as well as future publications.
 // Save each previous record with the same private history used for normal edits.
 async function migrateProfiles() {
-  const doc = await readPosts();
   const profiles = (await readProfiles()).profiles;
-  let changed = false;
-  for (const post of doc.posts) {
+  for (const post of [...posts.all()]) {
     if (post.profileId) continue;
     const configured = community.account(post.authorId);
     const profile = profiles.find((item) => item.id === configured?.profileId);
     const name = profile?.name || configured?.name;
     if (!name || (post.author === name && post.initials === initials(name) && (!profile || post.profileId === profile.id))) continue;
     await archivePost(post, { user: 'system' }, 'profile-name');
-    post.author = name;
-    post.initials = initials(name);
-    if (profile) post.profileId = profile.id;
-    changed = true;
+    await posts.put({ ...post, author: name, initials: initials(name), ...(profile ? { profileId: profile.id } : {}) });
   }
-  if (changed) await writePosts(doc);
-
 }
 
 /* ---------- post management ---------- */
@@ -271,16 +268,31 @@ async function readForm(req) {
   for (const file of files) if (!EXT[file.type]) fail(415, `Unsupported file type: ${file.type || 'unknown'}.`);
   const dryRun = field('dryRun');
   if (dryRun && !['true', 'false'].includes(dryRun)) fail(400, 'dryRun must be true or false.');
-  return { text, milestone, publishedAt: date ? new Date(date).toISOString() : null, meta, retained, files, dryRun: dryRun === 'true' };
+  // A synced draft posts its uploaded photos by reference instead of uploading them again.
+  let draft = null;
+  if (field('draftMedia')) {
+    let refs;
+    try { refs = JSON.parse(field('draftMedia')); } catch { fail(400, 'Invalid draft photos.'); }
+    const scope = draftScope(field('draftScope'));
+    if (!scope || !Array.isArray(refs)) fail(400, 'Invalid draft photos.');
+    if (files.length) fail(400, 'Send photos either as files or from the draft, not both.');
+    draft = { scope, refs };
+  }
+  return { text, milestone, publishedAt: date ? new Date(date).toISOString() : null, meta, retained, files, draft, dryRun: dryRun === 'true' };
 }
+async function useDraftMedia(input, who) {
+  if (!input.draft) return;
+  input.files = await drafts.files(who.user, input.draft.scope, input.draft.refs);
+  input.meta = input.draft.refs.map((ref) => ({ alt: typeof ref.alt === 'string' ? ref.alt : '' }));
+}
+const forgetDraft = (input, who) => input.draft ? drafts.remove(who.user, input.draft.scope).catch(() => {}) : null;
 
 function uploadedPath(src) {
   if (typeof src !== 'string' || !/^media\/\d{4}\/\d{2}\/[^/]+$/.test(src) || src.includes('..')) return null;
   return path.join(MEDIA_DIR, ...src.split('/').slice(1));
 }
-async function mediaReferences(doc) {
-  doc ||= await readPosts();
-  const refs = new Set(doc.posts.flatMap((post) => (post.media || []).flatMap((m) => [m.src, m.previewSrc].filter(Boolean))));
+async function mediaReferences() {
+  const refs = new Set(posts.all().flatMap((post) => (post.media || []).flatMap((m) => [m.src, m.previewSrc, m.posterSrc].filter(Boolean))));
   const site = JSON.parse(await fsp.readFile(path.join(DATA_DIR, 'site.json'), 'utf8'));
   if (site.avatar) refs.add(site.avatar);
   for (const profile of (await readProfiles()).profiles) {
@@ -289,35 +301,46 @@ async function mediaReferences(doc) {
   }
   return refs;
 }
-// Serving a photo checks that a post or profile still uses it. Re-reading and
-// parsing every JSON file per photo is slow for a large feed, so keep the set
-// until one of the files is replaced or modified. Writes replace files by
-// rename, which changes the inode, so a deletion takes effect on the next request.
-const REFERENCE_FILES = ['posts.json', 'site.json', 'profiles.json'];
+// Serving a photo checks that a post or profile still uses it. Rebuilding that set
+// per photo is slow for a large feed, so keep it until a post changes or the site
+// or profiles file is replaced or modified. Writes replace files by rename, which
+// changes the inode, so a deletion takes effect on the next request.
+const REFERENCE_FILES = ['site.json', 'profiles.json'];
 let referenceCache = { key: null, refs: null };
 async function servedMediaReferences() {
-  // Stat before reading: the set is never older than the key it is stored under.
+  // Key before reading: the set is never older than the key it is stored under.
   const stats = await Promise.all(REFERENCE_FILES.map((name) => fsp.stat(path.join(DATA_DIR, name), { bigint: true })));
-  const key = stats.map((s) => `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`).join('|');
+  const key = [posts.generation, ...stats.map((s) => `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`)].join('|');
   if (referenceCache.key !== key) referenceCache = { key, refs: await mediaReferences() };
   return referenceCache.refs;
 }
-async function removeUnused(items, doc) {
-  const refs = await mediaReferences(doc);
-  for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc].filter(Boolean)))) {
+async function removeUnused(items) {
+  const refs = await mediaReferences();
+  for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc, item.posterSrc].filter(Boolean)))) {
     const file = uploadedPath(src);
     if (!file || refs.has(src)) continue;
     try { await fsp.unlink(file); }
     catch (err) { if (err.code !== 'ENOENT') console.warn('Unused media cleanup failed:', path.basename(file), err.code); }
   }
 }
+// Photos are processed now. Videos are saved privately and converted in the
+// background: start the returned jobs once the post is saved (or discard them).
 async function storeMedia(input, publishedAt) {
   const sub = publishedAt.slice(0, 7).replace('-', '/');
   const prefix = `${publishedAt.slice(0, 10)}-${crypto.randomBytes(8).toString('hex')}`;
   await fsp.mkdir(path.join(MEDIA_DIR, sub), { recursive: true });
-  const media = [];
+  const media = [], jobs = [];
   try {
     for (const [i, file] of input.files.entries()) {
+      if (file.type.startsWith('video/')) {
+        if (!videos.available) fail(503, 'Video uploads need ffmpeg on the server. Ask the site owner to install it.');
+        const data = Buffer.from(await file.arrayBuffer()), format = sniffVideo(data.subarray(0, 12));
+        if (!format) fail(415, `${file.name}: choose an MP4, MOV, or WebM video.`);
+        const base = `media/${sub}/${prefix}-${i + 1}`;
+        media.push({ type: 'video', src: `${base}.mp4`, status: 'processing', alt: String(input.meta[i]?.alt || '').trim().slice(0, 300) });
+        jobs.push(await videos.stage({ data, format, src: `${base}.mp4`, posterSrc: `${base}.poster.webp` }));
+        continue;
+      }
       const photo = file.type.startsWith('image/') ? await preparePhoto(file) : null;
       const name = `${prefix}-${i + 1}${photo ? '.webp' : EXT[file.type]}`;
       const src = `media/${sub}/${name}`;
@@ -332,12 +355,61 @@ async function storeMedia(input, publishedAt) {
         if (photo.preview) await fsp.writeFile(uploadedPath(item.previewSrc), photo.preview, { flag: 'wx' });
         continue;
       }
-      await fsp.writeFile(uploadedPath(src), Buffer.from(await file.arrayBuffer()), { flag: 'wx' });
-      const width = Number(input.meta[i]?.width), height = Number(input.meta[i]?.height);
-      if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0 && width <= 100000 && height <= 100000) Object.assign(media.at(-1), { width: Math.round(width), height: Math.round(height) });
     }
-    return media;
-  } catch (err) { await removeUnused(media); throw err; }
+    return { media, jobs };
+  } catch (err) { await removeUnused(media); await discardVideos(jobs); throw err; }
+}
+const startVideos = (jobs) => { for (const job of jobs) videos.start(job); };
+const discardVideos = (jobs) => Promise.all(jobs.map((job) => videos.discard(job)));
+
+// A finished conversion replaces the placeholder (or, for a video published before
+// conversion existed, the original file) unless the post or video was removed meanwhile.
+async function finishVideo(job, result) {
+  await withLock(async () => {
+    const post = posts.all().find((item) => (item.media || []).some((m) => m.type === 'video' && m.src === job.match));
+    const video = post?.media.find((m) => m.src === job.match);
+    if (!video || (job.sourceSrc ? video.posterSrc : video.status !== 'processing')) return;
+    let next;
+    if (result.error) next = job.sourceSrc ? { ...video, transcodeFailed: true } : { ...video, status: 'failed' };
+    else {
+      await fsp.rename(result.tmpVideo, uploadedPath(job.src));
+      await fsp.rename(result.tmpPoster, uploadedPath(job.posterSrc));
+      const { status, transcodeFailed, width, height, duration, ...rest } = video;
+      next = { ...rest, src: job.src, posterSrc: job.posterSrc, width: result.width, height: result.height, ...(result.duration ? { duration: result.duration } : {}) };
+    }
+    await posts.put({ ...post, media: post.media.map((m) => m === video ? next : m) });
+    if (job.sourceSrc && !result.error) await removeUnused([{ src: job.sourceSrc }]);
+  });
+}
+
+// At startup: resume conversions a post still waits for, and convert videos that
+// were published unprocessed by earlier releases (they keep playing meanwhile).
+async function resumeVideos() {
+  // Jobs start only after this pass, so a quick conversion cannot race its writes.
+  const pending = await videos.pending(), waiting = new Set(), start = [];
+  for (const job of pending) {
+    const video = posts.all().flatMap((post) => post.media || []).find((m) => m.type === 'video' && m.src === job.match);
+    const wanted = video && (job.sourceSrc ? !video.posterSrc : video.status === 'processing');
+    if (!wanted) { await videos.discard(job); continue; }
+    waiting.add(job.match);
+    if (videos.available) start.push(job);
+  }
+  for (const post of [...posts.all()]) {
+    let changed = false;
+    const media = await Promise.all((post.media || []).map(async (video) => {
+      if (video.type !== 'video' || video.posterSrc || video.transcodeFailed || waiting.has(video.src)) return video;
+      if (video.status === 'processing') { changed = true; return { ...video, status: 'failed' }; } // Its upload was lost.
+      if (video.status || !videos.available) return video;
+      let format = null;
+      try { const handle = await fsp.open(uploadedPath(video.src)); try { const { buffer } = await handle.read(Buffer.alloc(12), 0, 12, 0); format = sniffVideo(buffer); } finally { await handle.close(); } } catch {}
+      if (!format) { changed = true; return { ...video, transcodeFailed: true }; }
+      const base = video.src.replace(/\.[^./]+$/, '') + '-web';
+      start.push(await videos.stageExisting({ sourceSrc: video.src, format, src: `${base}.mp4`, posterSrc: `${base}.poster.webp` }));
+      return video;
+    }));
+    if (changed) await posts.put({ ...post, media });
+  }
+  startVideos(start);
 }
 async function archivePost(post, who, action) {
   const directory = path.join(DATA_DIR, '.history');
@@ -348,22 +420,24 @@ async function archivePost(post, who, action) {
 
 async function createPost(req, res, who) {
   const input = await readForm(req);
+  await useDraftMedia(input, who);
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
   const publishedAt = input.publishedAt || new Date().toISOString();
   // Photo processing can take minutes for a large post. New files stay private
   // until the post that references them is written, so do it before locking.
-  const media = await storeMedia(input, publishedAt);
+  const { media, jobs } = await storeMedia(input, publishedAt);
   let post;
   try {
     post = await withLock(async () => {
       who = identity(req);
       if (!who) fail(401, 'Not signed in.');
-      const doc = await readPosts();
-      const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
-      await writePosts({ ...doc, posts: [...doc.posts, post] });
+      const post = { id: newPostId(publishedAt), ...(await postAuthor(who)), publishedAt, milestone: input.milestone, text: input.text, media };
+      await posts.put(post);
       return post;
     });
-  } catch (err) { await removeUnused(media); throw err; }
+  } catch (err) { await removeUnused(media); await discardVideos(jobs); throw err; }
+  startVideos(jobs);
+  await forgetDraft(input, who);
   return send(res, 201, postView(post, who));
 }
 
@@ -375,6 +449,7 @@ async function writeAgentReceipt(file, receipt) {
   await fsp.rename(tmp, file);
 }
 async function publishAgent(input, who, key, dryRun) {
+  if (input.draft) fail(400, 'Agents cannot post from drafts.');
   if (!input.text && !input.files.length) fail(400, 'Write something or add a photo.');
   // One agent publication at a time in this process, so no other request can
   // claim this idempotency key while its photos are processed below.
@@ -387,19 +462,19 @@ async function publishAgent(input, who, key, dryRun) {
     const keyHash = crypto.createHash('sha256').update(who.user + ':' + key).digest('hex');
     const receiptPath = path.join(directory, keyHash + '.json');
     // Answer a retry from its receipt. Called under the write lock.
-    const replay = async (doc) => {
+    const replay = async () => {
       let receipt;
       try { receipt = JSON.parse(await fsp.readFile(receiptPath, 'utf8')); }
       catch (cause) { if (cause.code !== 'ENOENT') throw cause; }
       if (!receipt) return null;
       if (receipt.requestHash !== requestHash) fail(409, 'This idempotency key was used for different content.');
-      const previous = doc.posts.find((post) => post.id === receipt.postId);
+      const previous = posts.get(receipt.postId);
       if (!previous) fail(receipt.state === 'committed' ? 410 : 409, receipt.state === 'committed' ? 'The original post was removed. It will not be recreated by a retry.' : 'The previous attempt is incomplete. Ask the owner to review it before changing the key.');
       if (receipt.state !== 'committed') await writeAgentReceipt(receiptPath, { ...receipt, state: 'committed' });
       return { post: editable(previous), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(previous.id)}`, replayed: true };
     };
     const admitted = await withLock(async () => {
-      const replayed = await replay(await readPosts());
+      const replayed = await replay();
       if (replayed) return { replayed };
       const now = Date.now(), recent = agentRates.get(who.user);
       const rate = recent && now - recent.started < 3600000 ? recent : { started: now, creates: 0, attempts: 0, minute: now };
@@ -419,13 +494,13 @@ async function publishAgent(input, who, key, dryRun) {
       return { dryRun: true, author: author.author, profileId: author.profileId, photos, published: false };
     }
     const publishedAt = input.publishedAt || new Date().toISOString();
-    const media = await storeMedia(input, publishedAt);
+    const { media, jobs } = await storeMedia(input, publishedAt);
+    let committed = false;
     try {
-      return await withLock(async () => {
-        const doc = await readPosts();
-        const replayed = await replay(doc); // Cannot happen while agentPublishing is held; checked anyway.
-        if (replayed) { await removeUnused(media); return replayed; }
-        const post = { id: `${publishedAt.slice(0, 10)}-${crypto.randomBytes(4).toString('hex')}`, ...author, publishedAt,
+      const result = await withLock(async () => {
+        const replayed = await replay(); // Cannot happen while agentPublishing is held; checked anyway.
+        if (replayed) { await removeUnused(media); await discardVideos(jobs); return replayed; }
+        const post = { id: newPostId(publishedAt), ...author, publishedAt,
           milestone: input.milestone, text: input.text, media };
         await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
         const audit = path.join(DATA_DIR, '.agent-audit.jsonl');
@@ -433,7 +508,8 @@ async function publishAgent(input, who, key, dryRun) {
         try {
           await writeAgentReceipt(receiptPath, { requestHash, postId: post.id, state: 'pending' });
           await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'prepared' }) + '\n', { mode: 0o600 });
-          await writePosts({ ...doc, posts: [...doc.posts, post] });
+          await posts.put(post);
+          committed = true;
         } catch (cause) {
           await fsp.unlink(receiptPath).catch(() => {});
           throw cause;
@@ -444,17 +520,18 @@ async function publishAgent(input, who, key, dryRun) {
         await fsp.appendFile(audit, JSON.stringify({ ...record, phase: 'committed' }) + '\n', { mode: 0o600 });
         return { post: editable(post), url: `${PUBLIC_ORIGIN}/#${encodeURIComponent(post.id)}`, replayed: false };
       });
-    } catch (cause) { await removeUnused(media); throw cause; }
+      if (committed) startVideos(jobs);
+      return result;
+    } catch (cause) { await removeUnused(media); if (!committed) await discardVideos(jobs); else startVideos(jobs); throw cause; }
   } finally { agentPublishing = false; }
 }
 
 // Locate the post and check access, version, and photo selection. updatePost runs
 // this before processing new photos and again under the write lock, so a post that
 // changed in the meantime is still refused with 412.
-function planUpdate(req, doc, who, id, input) {
-  const index = doc.posts.findIndex((p) => p.id === id);
-  if (index < 0) fail(404, 'This post no longer exists.');
-  const previous = doc.posts[index];
+function planUpdate(req, who, id, input) {
+  const previous = posts.get(id);
+  if (!previous) fail(404, 'This post no longer exists.');
   requireEdit(who, previous);
   checkVersion(req, previous);
   const retained = input.retained === null ? (previous.media || []) : input.retained.map(({ src, alt }) => {
@@ -464,45 +541,47 @@ function planUpdate(req, doc, who, id, input) {
   });
   if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
   if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
-  return { index, previous, retained, publishedAt: input.publishedAt || previous.publishedAt };
+  return { previous, retained, publishedAt: input.publishedAt || previous.publishedAt };
 }
 
 async function updatePost(req, res, who, id) {
   const input = await readForm(req);
-  const { publishedAt } = planUpdate(req, await readPosts(), who, id, input);
-  const added = await storeMedia(input, publishedAt);
+  await useDraftMedia(input, who);
+  const { publishedAt } = planUpdate(req, who, id, input);
+  const { media: added, jobs } = await storeMedia(input, publishedAt);
   let post;
   try {
     post = await withLock(async () => {
-      const doc = await readPosts();
-      const { index, previous, retained } = planUpdate(req, doc, who, id, input);
+      const { previous, retained } = planUpdate(req, who, id, input);
       const updated = { ...previous, text: input.text, milestone: input.milestone, publishedAt, media: [...retained, ...added], updatedAt: new Date(Math.max(Date.now(), (Date.parse(previous.updatedAt) || 0) + 1)).toISOString() };
       await archivePost(previous, who, 'edit');
-      await writePosts({ ...doc, posts: doc.posts.map((p, i) => i === index ? updated : p) });
+      await posts.put(updated);
       await removeUnused(previous.media || []);
       return updated;
     });
-  } catch (err) { await removeUnused(added); throw err; }
+  } catch (err) { await removeUnused(added); await discardVideos(jobs); throw err; }
+  startVideos(jobs);
+  await forgetDraft(input, who);
   return send(res, 200, postView(post, who));
 }
 
 async function deletePost(req, res, who, id) {
   if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
   await withLock(async () => {
-    const doc = await readPosts();
-    const previous = doc.posts.find((p) => p.id === id);
+    const previous = posts.get(id);
     if (!previous) fail(404, 'This post no longer exists.');
     requireEdit(who, previous);
     checkVersion(req, previous);
     await archivePost(previous, who, 'delete');
-    const updated = { ...doc, posts: doc.posts.filter((p) => p.id !== id) };
-    await writePosts(updated);
-    await removeUnused(previous.media || [], updated);
+    await posts.remove(id);
+    await loves.forget(id);
+    await removeUnused(previous.media || []);
   });
   return send(res, 204, '');
 }
 
-function listPosts(doc, url, who) {
+// One page of posts (already sorted newest first), shown through view(post).
+function listPosts(sorted, url, view) {
   let before;
   if (url.searchParams.has('before')) {
     try { before = JSON.parse(Buffer.from(url.searchParams.get('before'), 'base64url').toString()); }
@@ -510,11 +589,102 @@ function listPosts(doc, url, who) {
     if (!before || typeof before.id !== 'string' || !Number.isFinite(before.time)) fail(400, 'Invalid page. Refresh the post list.');
   }
   const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 20));
-  const posts = doc.posts.slice().sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt) || b.id.localeCompare(a.id));
-  const remaining = before ? posts.filter((p) => Date.parse(p.publishedAt) < before.time || (Date.parse(p.publishedAt) === before.time && p.id.localeCompare(before.id) < 0)) : posts;
+  const remaining = before ? sorted.filter((p) => Date.parse(p.publishedAt) < before.time || (Date.parse(p.publishedAt) === before.time && p.id.localeCompare(before.id) < 0)) : sorted;
   const page = remaining.slice(0, limit);
   const last = page.at(-1);
-  return { posts: page.map((post) => postView(post, who)), total: posts.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
+  return { posts: page.map(view), total: sorted.length, nextCursor: remaining.length > page.length ? Buffer.from(JSON.stringify({ time: Date.parse(last.publishedAt), id: last.id })).toString('base64url') : null };
+}
+
+/* ---------- public feed ---------- */
+// Readers page through the feed instead of downloading every post. These routes
+// are public and show only what /data/posts.json always has.
+const FEED_FILTERS = { all: () => true, photos: (post) => (post.media || []).length > 0, milestones: (post) => !!post.milestone };
+function feedSelection(url) {
+  const filter = url.searchParams.get('filter') || 'all', profile = url.searchParams.get('profile');
+  if (!Object.hasOwn(FEED_FILTERS, filter)) fail(400, 'Unknown feed filter.');
+  if (profile !== null && !/^[a-z][a-z0-9-]{0,47}$/.test(profile)) fail(400, 'Unknown profile.');
+  return { filter, profile };
+}
+const ofProfile = (profile) => (post) => !profile || post.profileId === profile;
+let summaryCache = { generation: -1, byProfile: new Map() };
+function feedSummary(profile) {
+  if (summaryCache.generation !== posts.generation) summaryCache = { generation: posts.generation, byProfile: new Map() };
+  const key = profile || '';
+  if (!summaryCache.byProfile.has(key)) {
+    const shown = posts.all().filter(ofProfile(profile));
+    const counts = Object.fromEntries(Object.entries(FEED_FILTERS).map(([name, keep]) => [name, shown.filter(keep).length]));
+    const recentPhotos = [];
+    for (const post of shown) {
+      for (const [index, media] of (post.media || []).entries()) {
+        if (media.type === 'image' && recentPhotos.length < 9) recentPhotos.push({ postId: post.id, index, src: media.src, previewSrc: media.previewSrc, alt: media.alt || '' });
+      }
+      if (recentPhotos.length >= 9) break;
+    }
+    const milestones = shown.filter(FEED_FILTERS.milestones).slice(0, 20).map((post) => ({ postId: post.id, milestone: post.milestone, publishedAt: post.publishedAt }));
+    if (summaryCache.byProfile.size > 200) summaryCache.byProfile.clear();
+    summaryCache.byProfile.set(key, { counts, recentPhotos, milestones });
+  }
+  return summaryCache.byProfile.get(key);
+}
+// Who is loving: a signed-in member (password session or identity proxy), or else this
+// browser's random visitor ID, which a member's browser links to their account.
+function loverKey(req) {
+  const who = identity(req);
+  return who ? memberKey(who.user) : visitorKey(req.headers['x-agentglade-visitor']);
+}
+const withLoves = (view, key) => (post) => ({ ...view(post), loves: loves.count(post.id), loved: loves.has(post.id, key) });
+const loveRates = new Map();
+function limitLoves(req) {
+  const now = Date.now(), address = humanAuth.clientAddress(req);
+  for (const [client, rate] of loveRates) if (now - rate.started >= 60000) loveRates.delete(client);
+  const rate = loveRates.get(address) || { started: now, count: 0 };
+  loveRates.set(address, rate);
+  if (++rate.count > 30 || loveRates.size > 50000) fail(429, 'Too many loves at once. Try again in a minute.');
+}
+async function handleLoves(req, res, pathname) {
+  const match = /^\/api\/feed\/posts\/([^/]+)\/love$/.exec(pathname);
+  if (pathname !== '/api/feed/loves/import' && !match) return false;
+  const key = loverKey(req);
+  if (pathname === '/api/feed/loves/import') {
+    // Loves saved only in this browser by earlier releases move to the server once.
+    if (req.method !== 'POST') return send(res, 405, { error: 'Use POST.' }, { Allow: 'POST' }), true;
+    const body = await readJSON(req);
+    if (!key) fail(400, 'Missing visitor ID.');
+    if (!Array.isArray(body?.ids) || body.ids.length > 300 || body.ids.some((id) => typeof id !== 'string')) fail(400, 'Send up to 300 post IDs.');
+    limitLoves(req);
+    if (loves.lovedBy(key) > 0) fail(409, 'This browser already keeps its loves on the server.');
+    const ids = [...new Set(body.ids)].filter((id) => posts.has(id));
+    for (const id of ids) await loves.set(id, key, true);
+    return send(res, 200, { imported: ids.length }), true;
+  }
+  if (req.method !== 'PUT' && req.method !== 'DELETE') return send(res, 405, { error: 'Use PUT or DELETE.' }, { Allow: 'PUT, DELETE' }), true;
+  if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
+  let id;
+  try { id = decodeURIComponent(match[1]); } catch { fail(400, 'Invalid post.'); }
+  if (!posts.has(id)) fail(404, 'This post no longer exists.');
+  if (!key) fail(400, 'Missing visitor ID.');
+  limitLoves(req);
+  await loves.set(id, key, req.method === 'PUT');
+  return send(res, 200, { loves: loves.count(id), loved: loves.has(id, key) }), true;
+}
+async function handleFeed(req, res, pathname, url) {
+  if (pathname !== '/api/feed' && !pathname.startsWith('/api/feed/')) return false;
+  if (await handleLoves(req, res, pathname)) return true;
+  if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Use GET.' }, { Allow: 'GET, HEAD' }), true;
+  const view = withLoves(publicView, loverKey(req));
+  if (pathname === '/api/feed') {
+    const { filter, profile } = feedSelection(url);
+    const keep = FEED_FILTERS[filter], mine = ofProfile(profile);
+    return send(res, 200, listPosts(posts.all().filter((post) => keep(post) && mine(post)), url, view)), true;
+  }
+  if (pathname === '/api/feed/summary') return send(res, 200, feedSummary(feedSelection(url).profile)), true;
+  const match = /^\/api\/feed\/posts\/([^/]+)$/.exec(pathname);
+  if (!match) return send(res, 404, { error: 'Not found.' }), true;
+  let id;
+  try { id = decodeURIComponent(match[1]); } catch { fail(400, 'Invalid post.'); }
+  const post = posts.get(id);
+  if (!post) fail(404, 'This post no longer exists.');
+  return send(res, 200, view(post)), true;
 }
 
 /* ---------- static files ---------- */
@@ -535,10 +705,7 @@ async function serveStatic(req, res, urlPath) {
   let file = resolveStatic(urlPath);
   if (!file) return send(res, 404, 'Not found');
   // Filter by resolved file so encoded paths cannot expose private account subjects.
-  if (file === path.join(DATA_DIR, 'posts.json')) {
-    const doc = await readPosts();
-    return send(res, 200, { posts: doc.posts.map(({ authorId, ...post }) => post) });
-  }
+  if (file === path.join(DATA_DIR, 'posts.json')) return send(res, 200, { posts: posts.all().map(publicView) });
   // Removed media must stop being public even if filesystem cleanup needs retrying.
   if (file.startsWith(MEDIA_DIR + path.sep)) {
     const src = 'media/' + path.relative(MEDIA_DIR, file).split(path.sep).join('/');
@@ -562,23 +729,62 @@ async function serveStatic(req, res, urlPath) {
     'Content-Type': MIME[ext] || 'application/octet-stream',
     'Cache-Control': fresh ? 'no-cache' : file.startsWith(MEDIA_DIR) ? 'private, max-age=31536000, immutable' : 'public, max-age=604800',
     'Last-Modified': stat.mtime.toUTCString(),
-    'Accept-Ranges': 'bytes',
   };
 
-  // Byte ranges, so Safari can play videos.
+  return streamFile(req, res, file, stat.size, headers);
+}
+// Send a file, honoring byte ranges so Safari can play videos.
+function streamFile(req, res, file, size, headers) {
+  headers = { ...headers, 'Accept-Ranges': 'bytes' };
   const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
   if (range) {
-    let start = range[1] === '' ? stat.size - Number(range[2]) : Number(range[1]);
-    let end = range[1] !== '' && range[2] !== '' ? Number(range[2]) : stat.size - 1;
-    end = Math.min(end, stat.size - 1);
-    if (start < 0 || start > end) return send(res, 416, '', { 'Content-Range': `bytes */${stat.size}` });
-    res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Content-Length': end - start + 1 });
+    let start = range[1] === '' ? size - Number(range[2]) : Number(range[1]);
+    let end = range[1] !== '' && range[2] !== '' ? Number(range[2]) : size - 1;
+    end = Math.min(end, size - 1);
+    if (start < 0 || start > end) return send(res, 416, '', { 'Content-Range': `bytes */${size}` });
+    res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${size}`, 'Content-Length': end - start + 1 });
     if (req.method === 'HEAD') return res.end();
     return pipeline(fs.createReadStream(file, { start, end }), res).catch(() => {});
   }
-  res.writeHead(200, { ...headers, 'Content-Length': stat.size });
+  res.writeHead(200, { ...headers, 'Content-Length': size });
   if (req.method === 'HEAD') return res.end();
   return pipeline(fs.createReadStream(file), res).catch(() => {});
+}
+
+/* ---------- drafts synced to a member's account ---------- */
+async function handleDrafts(req, res, who, pathname, url) {
+  const scope = draftScope(url.searchParams.get('scope'));
+  if (!scope) fail(400, 'Unknown draft.');
+  if (pathname === '/api/drafts') {
+    if (req.method === 'GET') {
+      const draft = await drafts.get(who.user, scope);
+      // No draft is not an error: fields is null, with finishedAt once one was posted or discarded.
+      return send(res, 200, draft?.fields ? draft : { fields: null, ...(draft?.finishedAt ? { finishedAt: draft.finishedAt } : {}) });
+    }
+    if (req.method === 'PUT') return send(res, 200, await drafts.save(who.user, scope, await readJSON(req, 131072)));
+    if (req.method === 'DELETE') { if (!sameOrigin(req)) fail(403, 'Cross-site request refused.'); await drafts.remove(who.user, scope); return send(res, 204, ''); }
+    return send(res, 405, { error: 'Use GET, PUT, or DELETE.' }, { Allow: 'GET, PUT, DELETE' });
+  }
+  if (pathname === '/api/drafts/media' && req.method === 'POST') {
+    const file = (await readMultipart(req)).get('media');
+    if (!file || typeof file !== 'object' || !file.size) fail(400, 'Choose a photo or video.');
+    if (!EXT[file.type]) fail(415, `Unsupported file type: ${file.type || 'unknown'}.`);
+    return send(res, 201, await drafts.addMedia(who.user, scope, file));
+  }
+  const match = /^\/api\/drafts\/media\/([a-f0-9]{32})$/.exec(pathname);
+  if (match && (req.method === 'GET' || req.method === 'HEAD')) {
+    const media = await drafts.media(who.user, scope, match[1]);
+    const stat = media && EXT[media.type] && await fsp.stat(media.file).catch(() => null);
+    if (!stat) return send(res, 404, { error: 'Not found.' });
+    // Uploads are shown only to their owner, and never run as a page.
+    return streamFile(req, res, media.file, stat.size, { 'Content-Type': media.type, 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'none'; sandbox" });
+  }
+  if (match && req.method === 'DELETE') {
+    if (!sameOrigin(req)) fail(403, 'Cross-site request refused.');
+    await drafts.removeMedia(who.user, scope, match[1]);
+    return send(res, 204, '');
+  }
+  return send(res, 404, { error: 'Not found.' });
 }
 
 /* ---------- router ---------- */
@@ -597,6 +803,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/healthz') return send(res, 200, 'ok');
     if (await humanAuth.handle(req, res, pathname)) return;
     if (await handleAgent(req, res, pathname, url.search)) return;
+    if (await handleFeed(req, res, pathname, url)) return;
     if (pathname.startsWith('/api/')) {
       const who = await ensureIdentity(req);
       if (!who) return send(res, 401, { error: 'Not signed in.' });
@@ -605,6 +812,13 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ...who, name: author.author, profileId: author.profileId || null });
       }
       if (pathname === '/api/profiles' && req.method === 'GET') return send(res, 200, { profiles: (await readProfiles()).profiles.map(editable) });
+      if (pathname === '/api/drafts' || pathname.startsWith('/api/drafts/')) return await handleDrafts(req, res, who, pathname, url);
+      if (pathname === '/api/me/visitor' && req.method === 'POST') {
+        const visitor = visitorKey((await readJSON(req))?.token);
+        if (!visitor) fail(400, 'Invalid visitor ID.');
+        await loves.link(visitor, memberKey(who.user));
+        return send(res, 204, '');
+      }
       if (pathname === '/api/me/setup' && req.method === 'POST') {
         await readJSON(req);
         await withLock(() => community.finishSetup(who));
@@ -612,7 +826,7 @@ const server = http.createServer(async (req, res) => {
       }
       const profileMatch = /^\/api\/profiles\/([a-z][a-z0-9-]{0,47})$/.exec(pathname);
       if (profileMatch && req.method === 'PUT') return await updateProfile(req, res, who, profileMatch[1]);
-      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(await readPosts(), url, who));
+      if (pathname === '/api/posts' && req.method === 'GET') return send(res, 200, listPosts(posts.all(), url, withLoves((post) => postView(post, who), memberKey(who.user))));
       if (pathname === '/api/posts' && req.method === 'POST') return await createPost(req, res, who);
       const match = /^\/api\/posts\/([^/]+)$/.exec(pathname);
       if (match) {
@@ -621,7 +835,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'PUT') return await updatePost(req, res, who, id);
         if (req.method === 'DELETE') return await deletePost(req, res, who, id);
         if (req.method === 'GET') {
-          const post = (await readPosts()).posts.find((p) => p.id === id);
+          const post = posts.get(id);
           if (!post) fail(404, 'This post no longer exists.');
           return send(res, 200, postView(post, who), { ETag: `"${version(post)}"` });
         }
@@ -647,8 +861,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 await seed();
+posts = await openPostStore(DATA_DIR);
 await community.initialize();
 await migrateProfiles();
+loves = await openLoveStore(DATA_DIR);
+drafts = await openDraftStore({ dataDir: DATA_DIR, maxBytes: MAX_UPLOAD });
+await drafts.sweep();
+await loves.compact((id) => posts.has(id));
+videos = await createVideoProcessor({ dataDir: DATA_DIR, mediaPath: uploadedPath, complete: finishVideo });
+await resumeVideos();
 server.listen(PORT, () => console.log(`agentglade listening on :${server.address().port} (data ${DATA_DIR}, media ${MEDIA_DIR})`));
 
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { server.close(() => process.exit(0)); server.closeIdleConnections(); });
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { videos?.stop(); server.close(() => process.exit(0)); server.closeIdleConnections(); });

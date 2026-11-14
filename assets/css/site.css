@@ -139,12 +139,16 @@ img, video { display: block; max-width: 100%; }
 .post-action:hover { background: var(--surface-strong); color: var(--text); }
 .post-action[aria-pressed="true"] { color: var(--danger); }
 .post-action[aria-pressed="true"] .icon { fill: currentColor; }
+.love-count { min-width: 1.2em; font-variant-numeric: tabular-nums; }
 .post-action.is-done { color: var(--mint); }
 
 .feed-end { display: flex; align-items: center; gap: .75rem; padding: 1rem 0; color: var(--quiet); font-family: var(--font-mono); font-size: .72rem; }
 .feed-end::before, .feed-end::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
 .feed-status { padding: 2rem 1rem; text-align: center; color: var(--muted); font-family: var(--font-mono); font-size: .8rem; }
 .feed-status.is-error { color: var(--danger); }
+.feed-more { display: flex; justify-content: center; padding: 1rem 0; }
+.feed-linked { margin-bottom: 1rem; }
+.feed-linked-note { display: flex; justify-content: space-between; gap: 1rem; margin: 0 0 .5rem; color: var(--muted); font-family: var(--font-mono); font-size: .72rem; }
 
 /* Skeleton while loading */
 .skeleton { height: 420px; background-color: var(--surface); background-image: radial-gradient(circle, var(--rule-soft) 1px, transparent 1px); background-size: 18px 18px; border: var(--stroke-hairline) solid var(--rule); border-radius: var(--radius-sm); }

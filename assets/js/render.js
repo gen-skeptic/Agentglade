@@ -48,16 +48,23 @@ function mediaHtml(post, interactive = true) {
   const cls = `media media-${Math.min(items.length, 4)}`;
   const cells = shown.map((m, i) => {
     const src = resolve(m.previewSrc || m.src);
-    const inner = m.pendingPreview ? '<span class="media-pending">Photo preview available after posting</span>' : m.type === 'video'
-      ? `<video src="${esc(src)}" muted playsinline preload="metadata"></video><span class="media-play">${icon('play')}</span>`
+    // A video is converted after posting; until then its slot says so instead of playing.
+    const waiting = m.type === 'video' && m.status;
+    const inner = m.pendingPreview ? '<span class="media-pending">Photo preview available after posting</span>'
+      : waiting ? `<span class="media-pending">${m.status === 'failed' ? 'This video could not be processed.' : 'Video processing… It appears here when ready.'}</span>`
+      : m.type === 'video'
+      ? `<video src="${esc(src)}"${m.posterSrc ? ` poster="${esc(resolve(m.posterSrc))}" preload="none"` : ' preload="metadata"'} muted playsinline${m.width ? ` width="${m.width}" height="${m.height}"` : ''}></video><span class="media-play">${icon('play')}</span>`
       : `<img src="${esc(src)}" alt="${esc(m.alt || '')}" loading="lazy" decoding="async"${m.width ? ` width="${m.width}" height="${m.height}"` : ''}>`;
     const more = i === 3 && items.length > 4 ? `<span class="media-more">+${items.length - 4}</span>` : '';
-    return interactive
+    return interactive && !waiting
       ? `<button type="button" class="media-item" data-open="${esc(post.id)}" data-index="${i}" aria-label="Open ${m.type === 'video' ? 'video' : 'photo'} ${i + 1} of ${items.length}${m.alt ? `: ${esc(m.alt)}` : ''}">${inner}${more}</button>`
       : `<div class="media-item">${inner}${more}</div>`;
   }).join('');
   return `<div class="${cls}">${cells}</div>`;
 }
+
+export const loveCount = (n) => n ? `<span class="love-count" aria-hidden="true">${n}</span>` : '';
+export const loveLabel = (n) => n ? `Love (${n} ${n === 1 ? 'love' : 'loves'})` : 'Love';
 
 export function renderPost(post, { born = null, preview = false } = {}) {
   const profile = profileForPost(post);
@@ -67,7 +74,7 @@ export function renderPost(post, { born = null, preview = false } = {}) {
   const permalink = `#${encodeURIComponent(post.id)}`;
   const actions = preview ? '' : `
     <div class="post-actions">
-      <button type="button" class="post-action" data-love="${esc(post.id)}" aria-pressed="false">${icon('heart')}<span>Love</span></button>
+      <button type="button" class="post-action" data-love="${esc(post.id)}" aria-pressed="${post.loved ? 'true' : 'false'}" aria-label="${loveLabel(post.loves)}">${icon('heart')}<span>Love</span>${loveCount(post.loves)}</button>
       <button type="button" class="post-action" data-copy="${esc(post.id)}">${icon('link')}<span>Copy link</span></button>
     </div>`;
   return `

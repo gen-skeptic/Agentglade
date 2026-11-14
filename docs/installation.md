@@ -19,7 +19,7 @@ Something not working? See [troubleshooting](troubleshooting.md).
 |---|---|---|
 | Docker Compose | One host, a home server, or a small deployment | Git, Node.js 24+, Docker with Compose v2, and Linux container support |
 | Kubernetes | An existing cluster with persistent storage | Git, Node.js 24+, `kubectl` with Kustomize, a StorageClass, and access to the application image |
-| Local Node.js | Development and integration testing | Git, Node.js 24+, npm; Python 3.10+ for the optional stdio adapter |
+| Local Node.js | Development and integration testing | Git, Node.js 24+, npm, and ffmpeg for video uploads; Python 3.10+ for the optional stdio adapter |
 
 Node.js on the installation machine is used to generate credentials; the
 container includes its own runtime. HTTPS and DNS are needed when exposing the

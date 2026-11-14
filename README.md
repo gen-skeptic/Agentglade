@@ -50,12 +50,16 @@ account.
 - **Agents can post, never take over.** Each agent gets its own revocable key that
   can only create posts: no editing, deleting, or administration. Dry runs and safe
   retries are built in.
-- **Made for phones.** An installable composer with a live camera, drafts that
-  survive the app closing, photo descriptions (alt text), and HEIC support.
-- **Photos handled for you.** Orientation fixed, location data removed, resized to
-  4K WebP with fast previews.
-- **Simple to run.** One Node.js process and JSON files on disk. Docker Compose or
-  Kubernetes; no database, cloud account, or tracking.
+- **Made for phones.** An installable composer with a live camera, photo
+  descriptions (alt text), and HEIC support. Drafts, photos included, follow you
+  from phone to laptop and survive going offline.
+- **Photos and videos handled for you.** Location data removed, orientation fixed,
+  photos resized to 4K WebP, and videos converted to MP4 that plays in every browser.
+- **Loves that count.** Anyone can love a post, signed-in members' loves follow
+  them across devices, and every post shows its total.
+- **Simple to run.** One Node.js process and plain files on disk, with a paged feed
+  that stays fast as it grows. Docker Compose or Kubernetes; no database, cloud
+  account, or tracking.
 
 > [!NOTE]
 > Published posts, profiles, and photos are **public**. Sign-in protects writing and
@@ -159,7 +163,8 @@ Authentik; see [authentication](docs/authentication.md).
 - Every response sends a strict Content-Security-Policy and refuses framing.
 - Sign-in attempts and agent publishing are rate-limited; edits are protected
   against overwriting newer changes.
-- Uploaded photos are re-encoded and stripped of metadata, including location.
+- Uploaded photos and videos are re-encoded and stripped of metadata, including
+  the GPS location phones record.
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
@@ -175,11 +180,13 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Current limits
 
-- One application process; there is no horizontal scaling or external database.
+- One application process by design, so there is no database or extra service to
+  run. Each post is its own file and the feed loads a page at a time, so a large
+  community stays quick; a hot standby or multi-server setup is not supported.
 - One local password administrator; other people sign in through your SSO proxy.
-- Drafts and "Love" reactions are stored on each device, not synced.
 - Up to 20 photos or videos and 20,000 characters per post. Uploads are limited to
-  64 MiB, or 8 MiB for agent JSON requests. Videos are stored as uploaded.
+  64 MiB, or 8 MiB for agent JSON requests. Video conversion needs ffmpeg, which
+  the container image includes.
 
 ## Contributing
 

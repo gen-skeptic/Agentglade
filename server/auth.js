@@ -67,6 +67,7 @@ export async function createHumanAuth({ configFile, origin, trustedProxies = [] 
     return req.headers.origin === origin && (!req.headers['sec-fetch-site'] || req.headers['sec-fetch-site'] === 'same-origin');
   }
   return {
+    clientAddress,
     localSubject,
     localAccount: admin ? { name: admin.name || admin.username, profileId: 'admin' } : null,
     identity(req) {

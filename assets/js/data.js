@@ -3,8 +3,22 @@ export const SITE_ROOT = new URL('../../', import.meta.url);
 
 export const resolve = (path) => (/^(blob:|data:|https?:)/.test(path) ? path : new URL(path, SITE_ROOT).href);
 
+// A random ID for this browser, so a reader's loves count once and stay theirs.
+// A member's browser is linked to their account when they open a community page.
+const VISITOR = 'agentglade.visitor';
+let sessionVisitor;
+export function visitorId() {
+  const fresh = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  try {
+    let id = localStorage.getItem(VISITOR);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(id || '')) { id = fresh(); localStorage.setItem(VISITOR, id); }
+    return id;
+  } catch { return (sessionVisitor ||= fresh()); }
+}
+const visitorHeaders = () => ({ 'X-Agentglade-Visitor': visitorId() });
+
 async function getJSON(path) {
-  const res = await fetch(resolve(path), { cache: 'no-cache' });
+  const res = await fetch(resolve(path), { cache: 'no-cache', ...(path.startsWith('api/feed') ? { headers: visitorHeaders() } : {}) });
   if (!res.ok) throw new Error(`${path}: ${res.status}`);
   return res.json();
 }
@@ -14,10 +28,21 @@ export async function loadSite() {
 }
 export const loadProfiles = async () => (await getJSON('data/profiles.json')).profiles;
 
-export async function loadPosts() {
-  const { posts } = await getJSON('data/posts.json');
-  return posts.slice().sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+// The public feed is read a page at a time; filter is all, photos, or milestones.
+const query = (values) => new URLSearchParams(Object.entries(values).filter(([, value]) => value)).toString();
+export const loadFeedPage = ({ before = null, filter = 'all', profile = null } = {}) =>
+  getJSON(`api/feed?${query({ before, filter: filter === 'all' ? null : filter, profile })}`);
+export const loadFeedSummary = (profile = null) => getJSON(`api/feed/summary?${query({ profile })}`);
+export const loadFeedPost = (id) => getJSON(`api/feed/posts/${encodeURIComponent(id)}`);
+export async function setLove(id, loved) {
+  const res = await fetch(resolve(`api/feed/posts/${encodeURIComponent(id)}/love`), { method: loved ? 'PUT' : 'DELETE', headers: visitorHeaders(), credentials: 'same-origin' });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Love failed: ${res.status}`);
+  return res.json();
 }
+export const importLoves = (ids) => fetch(resolve('api/feed/loves/import'), { method: 'POST', credentials: 'same-origin',
+  headers: { ...visitorHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
+export const linkVisitor = () => fetch(resolve('api/me/visitor'), { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+  headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: visitorId() }) });
 
 // Multipart mutations use the current human session and server-bound author.
 async function communityRequest(path, options = {}) {
@@ -57,19 +82,25 @@ export const deletePost = (post) => communityRequest(`api/posts/${encodeURICompo
   method: 'DELETE', headers: { 'If-Match': `"${post.version}"` },
 });
 
-async function savePost({ text, milestone, publishedAt, files, alts = [], retainMedia }, { onStage, id, version } = {}) {
-  const { prepareMedia } = await import('./media.js?v=8');
-  onStage?.('Preparing photos…');
-  const prepared = await prepareMedia(files, { onProgress: onStage });
+// draft: { scope, media: [{ id, alt }] } posts media already saved to the account's draft.
+async function savePost({ text, milestone, publishedAt, files, alts = [], retainMedia, draft }, { onStage, id, version } = {}) {
   const fd = new FormData();
   fd.set('text', text || '');
   if (milestone) fd.set('milestone', milestone);
   fd.set('publishedAt', publishedAt);
-  fd.set('mediaMeta', JSON.stringify(prepared.map(({ width, height }, i) => ({ width, height, alt: alts[i] || '' }))));
   if (id) fd.set('retainMedia', JSON.stringify(retainMedia || []));
-  prepared.forEach(({ file }) => fd.append('media', file, file.name));
+  if (draft) {
+    fd.set('draftScope', draft.scope);
+    fd.set('draftMedia', JSON.stringify(draft.media));
+  } else {
+    const { prepareMedia } = await import('./media.js?v=8');
+    onStage?.('Preparing photos…');
+    const prepared = await prepareMedia(files, { onProgress: onStage });
+    fd.set('mediaMeta', JSON.stringify(prepared.map(({ width, height }, i) => ({ width, height, alt: alts[i] || '' }))));
+    prepared.forEach(({ file }) => fd.append('media', file, file.name));
+  }
 
-  onStage?.('Uploading and optimizing photos…');
+  onStage?.(draft ? 'Publishing and optimizing photos…' : 'Uploading and optimizing photos…');
   return communityRequest(id ? `api/posts/${encodeURIComponent(id)}` : 'api/posts', {
     method: id ? 'PUT' : 'POST', body: fd,
     ...(id ? { headers: { 'If-Match': `"${version}"` } } : {}),

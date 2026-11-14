@@ -1,4 +1,5 @@
 import { hashSecret } from './auth.js';
+import { storedPosts } from './fixtures/posts.js';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -24,7 +25,6 @@ function photoForm(text, files = []) {
 before(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentglade-concurrency-tests-'));
   await fs.mkdir(path.join(root, 'data'));
-  await fs.writeFile(path.join(root, 'data/posts.json'), '{"posts":[]}');
   const authFile = path.join(root, 'auth.json');
   await fs.writeFile(authFile, JSON.stringify({ proxyTokenHash: hashSecret(proxyKey) }), { mode: 0o600 });
   const agentFile = path.join(root, 'agents.json');
@@ -88,6 +88,6 @@ test('an agent’s slow photo post does not hold up members, and its retry still
   const retry = await fetch(base + '/api/agent/posts', { method: 'POST', headers: asAgent('slow-agent-photo-0001'), body: photoForm('An agent photo update', [slowPhoto]) });
   const replay = await retry.json();
   assert.equal(retry.status, 200); assert.equal(replay.replayed, true); assert.equal(replay.post.id, results.agent.body.post.id);
-  const stored = JSON.parse(await fs.readFile(path.join(root, 'data/posts.json'))).posts;
+  const stored = [...(await storedPosts(path.join(root, 'data'))).values()];
   assert.equal(stored.filter((post) => post.text === 'An agent photo update').length, 1);
 });

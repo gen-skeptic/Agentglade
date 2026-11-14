@@ -1,6 +1,10 @@
 FROM node:24.22.1-alpine
 ENV NODE_ENV=production PORT=8080 SITE_DIR=/app DATA_DIR=/data MEDIA_DIR=/media
 WORKDIR /app
+# Uploaded videos are converted with ffmpeg (H.264 MP4, metadata and location removed).
+RUN apk add --no-cache ffmpeg \
+  && ffmpeg -hide_banner -encoders | grep -q libx264 \
+  && ffmpeg -hide_banner -encoders | grep -qE '^ A[.A-Z]+ aac '
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY index.html robots.txt ./
