@@ -97,7 +97,7 @@ async function saveToServer() {
 function queueUpload(file) {
   if (!state.syncOn || state.remote.has(file) || !state.files.includes(file)) return uploads;
   state.uploading++;
-  el.draft.textContent = 'Saving photos to your account…';
+  el.draft.textContent = 'Saving media to your account…';
   uploads = uploads.then(async () => {
     if (!state.files.includes(file) || state.remote.has(file) || state.finished) return;
     const [prepared] = await prepareMedia([file]);
@@ -112,7 +112,7 @@ function queueUpload(file) {
 function persistMedia() {
   const snapshot = state.files.map((file) => ({ file, alt: state.alts.get(file) || '', remoteId: state.remote.get(file) || null, remoteOnly: state.remoteOnly.has(file) }));
   mediaSave = mediaSave.then(() => saveMedia(snapshot, scope));
-  mediaSave.then((ok) => { if (!ok) toast('This device could not save draft photos. Keep this page open until you post.', 'error'); });
+  mediaSave.then((ok) => { if (!ok) toast('This device could not save draft media. Keep this page open until you post.', 'error'); });
 }
 function queuePreviews(files) {
   for (const file of files) if (state.remoteOnly.has(file)) state.previews.set(file, 'remote');
@@ -285,7 +285,7 @@ async function submit(event) {
       await uploads;
       if (state.files.every((file) => state.remote.has(file))) draftMedia = state.files.map((file) => ({ id: state.remote.get(file), alt: state.alts.get(file) || '' }));
     }
-    if (!draftMedia && state.files.some((file) => state.remoteOnly.has(file))) throw new Error('Some photos in this draft are saved only in your account. Reconnect and try again.');
+    if (!draftMedia && state.files.some((file) => state.remoteOnly.has(file))) throw new Error('Some photos or videos in this draft are saved only in your account. Reconnect and try again.');
     const post = draftPost();
     const input = { text: post.text, milestone: post.milestone, publishedAt: post.publishedAt,
       files: draftMedia ? [] : [...state.files], alts: state.files.map((file) => state.alts.get(file) || ''),

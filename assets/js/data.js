@@ -100,7 +100,7 @@ async function savePost({ text, milestone, publishedAt, files, alts = [], retain
     prepared.forEach(({ file }) => fd.append('media', file, file.name));
   }
 
-  onStage?.(draft ? 'Publishing and optimizing photos…' : 'Uploading and optimizing photos…');
+  onStage?.(draft ? 'Publishing and optimizing media…' : 'Uploading and optimizing media…');
   return communityRequest(id ? `api/posts/${encodeURIComponent(id)}` : 'api/posts', {
     method: id ? 'PUT' : 'POST', body: fd,
     ...(id ? { headers: { 'If-Match': `"${version}"` } } : {}),

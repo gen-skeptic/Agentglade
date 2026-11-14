@@ -56,7 +56,7 @@
 
       <section class="compose-media" aria-label="Photos and videos">
         <ul class="tray" id="tray"></ul>
-        <p class="compose-media-help">Photos are automatically optimized up to 4K. Smaller previews keep the feed fast.</p>
+        <p class="compose-media-help">Add photos and videos with Media. Photos are optimized up to 4K; videos are converted to MP4 with their location removed.</p>
         <p class="compose-media-help" id="preview-status" role="status" hidden>Preparing photo previews…</p>
       </section>
 
@@ -82,8 +82,8 @@
       <span class="tools-label">Add to your post</span>
       <div class="tools">
         <label class="tool">
-          <input class="sr-only" type="file" id="pick-library" accept="image/*,video/*" multiple>
-          <i data-icon="image" class="icon-lg"></i><span>Photos</span>
+          <input class="sr-only" type="file" id="pick-library" accept="image/*,video/*" multiple aria-label="Add photos and videos">
+          <i data-icon="image" class="icon-lg"></i><span>Media</span>
         </label>
         <button type="button" class="tool" id="open-camera">
           <i data-icon="camera" class="icon-lg"></i><span>Camera</span>
