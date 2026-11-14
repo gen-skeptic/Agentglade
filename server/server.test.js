@@ -226,6 +226,16 @@ test('deletion removes the post and its exclusive uploaded media from public acc
   await fs.writeFile(path.join(directory, 'media/2026/11/orphan.png'), png);
   assert.equal((await fetch(base + '/media/2026/11/orphan.png')).status, 404);
 });
+test('a photo stops being public as soon as posts.json no longer uses it, even after a same-size manual edit', async () => {
+  assert.equal((await fetch(base + '/' + shared)).status, 200); // Caches the reference check.
+  const file = path.join(directory, 'data/posts.json'), before = await fs.readFile(file, 'utf8');
+  const edited = before.replaceAll('shared.png', 'sharex.png');
+  assert.equal(edited.length, before.length);
+  await fs.writeFile(file, edited); // In place: same inode and size.
+  assert.equal((await fetch(base + '/' + shared)).status, 404);
+  await fs.writeFile(file, before);
+  assert.equal((await fetch(base + '/' + shared)).status, 200);
+});
 test('master and preview are public while referenced and are cleaned together on deletion', async () => {
   const data = await sharp({ create: { width: 1600, height: 900, channels: 3, background: '#667788' } }).png().toBuffer();
   const saved = await call('/api/posts', { method: 'POST', body: form({ files: [{ data }], meta: [{ width: 99999, height: 99999 }] }) });

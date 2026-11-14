@@ -280,6 +280,19 @@ async function mediaReferences(doc) {
   }
   return refs;
 }
+// Serving a photo checks that a post or profile still uses it. Re-reading and
+// parsing every JSON file per photo is slow for a large feed, so keep the set
+// until one of the files is replaced or modified. Writes replace files by
+// rename, which changes the inode, so a deletion takes effect on the next request.
+const REFERENCE_FILES = ['posts.json', 'site.json', 'profiles.json'];
+let referenceCache = { key: null, refs: null };
+async function servedMediaReferences() {
+  // Stat before reading: the set is never older than the key it is stored under.
+  const stats = await Promise.all(REFERENCE_FILES.map((name) => fsp.stat(path.join(DATA_DIR, name), { bigint: true })));
+  const key = stats.map((s) => `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`).join('|');
+  if (referenceCache.key !== key) referenceCache = { key, refs: await mediaReferences() };
+  return referenceCache.refs;
+}
 async function removeUnused(items, doc) {
   const refs = await mediaReferences(doc);
   for (const src of new Set(items.flatMap((item) => [item.src, item.previewSrc].filter(Boolean)))) {
@@ -506,7 +519,7 @@ async function serveStatic(req, res, urlPath) {
   // Removed media must stop being public even if filesystem cleanup needs retrying.
   if (file.startsWith(MEDIA_DIR + path.sep)) {
     const src = 'media/' + path.relative(MEDIA_DIR, file).split(path.sep).join('/');
-    if (!(await mediaReferences()).has(src)) return send(res, 404, 'Not found');
+    if (!(await servedMediaReferences()).has(src)) return send(res, 404, 'Not found');
   }
   let stat;
   try {
