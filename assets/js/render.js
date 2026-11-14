@@ -53,7 +53,7 @@ function mediaHtml(post, interactive = true) {
       : `<img src="${esc(src)}" alt="${esc(m.alt || '')}" loading="lazy" decoding="async"${m.width ? ` width="${m.width}" height="${m.height}"` : ''}>`;
     const more = i === 3 && items.length > 4 ? `<span class="media-more">+${items.length - 4}</span>` : '';
     return interactive
-      ? `<button type="button" class="media-item" data-open="${esc(post.id)}" data-index="${i}" aria-label="Open ${m.type === 'video' ? 'video' : 'photo'} ${i + 1} of ${items.length}">${inner}${more}</button>`
+      ? `<button type="button" class="media-item" data-open="${esc(post.id)}" data-index="${i}" aria-label="Open ${m.type === 'video' ? 'video' : 'photo'} ${i + 1} of ${items.length}${m.alt ? `: ${esc(m.alt)}` : ''}">${inner}${more}</button>`
       : `<div class="media-item">${inner}${more}</div>`;
   }).join('');
   return `<div class="${cls}">${cells}</div>`;

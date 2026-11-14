@@ -213,6 +213,19 @@ test('photos can be added, retained, and removed without deleting media shared b
   await assert.rejects(fs.stat(path.join(directory, uploaded)), { code: 'ENOENT' });
   assert.equal((await fetch(base + '/' + shared)).status, 200);
 });
+test('photo descriptions are saved with new photos and can be changed on kept photos', async () => {
+  const created = await call('/api/posts', { method: 'POST', body: form({ files: [{}], meta: [{ alt: '  A blue-grey square  ' }] }) });
+  assert.equal(created.status, 201); assert.equal(created.body.media[0].alt, 'A blue-grey square');
+  const src = created.body.media[0].src;
+  const described = await call(`/api/posts/${created.body.id}`, { method: 'PUT', version: created.body.version, body: form({ retained: [{ src, alt: 'A small square in slate blue' }] }) });
+  assert.equal(described.status, 200); assert.equal(described.body.media[0].alt, 'A small square in slate blue'); assert.equal(described.body.media[0].src, src);
+  // Older clients send only the src and keep the existing description.
+  const kept = await call(`/api/posts/${created.body.id}`, { method: 'PUT', version: described.body.version, body: form({ retained: [src] }) });
+  assert.equal(kept.body.media[0].alt, 'A small square in slate blue');
+  for (const retained of [[{ src, alt: 7 }], [{ alt: 'no src' }], [src, { src }]]) {
+    assert.equal((await call(`/api/posts/${created.body.id}`, { method: 'PUT', version: kept.body.version, body: form({ retained }) })).status, 400);
+  }
+});
 test('deletion removes the post and its exclusive uploaded media from public access', async () => {
   const created = await call('/api/posts', { method: 'POST', body: form({ files: [{}] }) });
   assert.equal(created.status, 201);

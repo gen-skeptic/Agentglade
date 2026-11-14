@@ -23,12 +23,13 @@ function db() {
   });
 }
 
-export async function saveMedia(files, scope = 'new') {
+// items: [{ file, alt }]. Descriptions are kept with the draft photos.
+export async function saveMedia(items, scope = 'new') {
   let d;
   try {
     d = await db();
     const tx = d.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put(files.map((f) => ({ blob: f, name: f.name, type: f.type })), mediaKey(scope));
+    tx.objectStore(STORE).put(items.map(({ file, alt = '' }) => ({ blob: file, name: file.name, type: file.type, alt })), mediaKey(scope));
     await new Promise((r, j) => { tx.oncomplete = r; tx.onerror = () => j(tx.error); });
     return true;
   } catch (e) { console.warn('Draft media not saved', e); return false; }
@@ -41,7 +42,7 @@ export async function loadMedia(scope = 'new') {
     d = await db();
     const req = d.transaction(STORE).objectStore(STORE).get(mediaKey(scope));
     const rows = await new Promise((r, j) => { req.onsuccess = () => r(req.result || []); req.onerror = () => j(req.error); });
-    return rows.map((x) => new File([x.blob], x.name, { type: x.type }));
+    return rows.map((x) => ({ file: new File([x.blob], x.name, { type: x.type }), alt: typeof x.alt === 'string' ? x.alt : '' }));
   } catch { return []; }
   finally { d?.close(); }
 }

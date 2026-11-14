@@ -11,7 +11,7 @@ const $ = (s) => document.querySelector(s);
 const editId = new URLSearchParams(location.search).get('edit');
 const scope = editId ? `edit:${editId}` : 'new';
 const MAX_FILES = 20;
-const state = { files: [], existing: [], urls: new Map(), previews: new Map(), previewJobs: 0, milestoneOn: false, saving: false, ready: false, finished: false };
+const state = { files: [], existing: [], alts: new Map(), describing: null, urls: new Map(), previews: new Map(), previewJobs: 0, milestoneOn: false, saving: false, ready: false, finished: false };
 let session, original, site = {}, draftTimer, toastTimer;
 let mediaSave = Promise.resolve(true);
 let previewQueue = Promise.resolve();
@@ -57,7 +57,7 @@ function setBusy(busy) {
 }
 function fields() {
   return { text: el.text.value, milestone: el.milestone.value, milestoneOn: state.milestoneOn,
-    when: el.when.value, retained: state.existing.map((m) => m.src), version: original?.version };
+    when: el.when.value, retained: state.existing.map((m) => ({ src: m.src, alt: m.alt || '' })), version: original?.version };
 }
 function persistDraft() {
   clearTimeout(draftTimer);
@@ -68,7 +68,7 @@ function persistDraft() {
   }, 400);
 }
 function persistMedia() {
-  const snapshot = [...state.files];
+  const snapshot = state.files.map((file) => ({ file, alt: state.alts.get(file) || '' }));
   mediaSave = mediaSave.then(() => saveMedia(snapshot, scope));
   mediaSave.then((ok) => { if (!ok) toast('This device could not save draft photos. Keep this page open until you post.', 'error'); });
 }
@@ -92,14 +92,16 @@ function queuePreviews(files) {
 }
 function renderTray() {
   const items = [
-    ...state.existing.map((media, i) => ({ video: media.type === 'video', src: resolve(media.previewSrc || media.src), remove: `data-remove-existing="${i}"` })),
+    ...state.existing.map((media, i) => ({ video: media.type === 'video', src: resolve(media.previewSrc || media.src), remove: `data-remove-existing="${i}"`,
+      alt: media.alt, describe: `data-describe-existing="${i}"` })),
     ...state.files.map((file, i) => ({ video: file.type.startsWith('video/'),
       src: file.type.startsWith('video/') || state.previews.get(file) ? urlFor(file) : null,
-      pending: !state.previews.has(file), remove: `data-remove="${i}"` })),
+      pending: !state.previews.has(file), remove: `data-remove="${i}"`, alt: state.alts.get(file), describe: `data-describe="${i}"` })),
   ];
   const cells = items.map((item, i) => `<li>
     ${item.video ? `<video src="${esc(item.src)}" muted playsinline preload="metadata"></video><span class="media-play">${icon('play')}</span>` : item.src ? `<img src="${esc(item.src)}" alt="Photo ${i + 1}" data-photo-preview><span class="tray-file-label" hidden>Photo ${i + 1}<br>Preview after posting</span>` : `<span class="tray-file-label">Photo ${i + 1}<br>${item.pending ? 'Preparing preview…' : 'Preview after posting'}</span>`}
     <span class="tray-index">${i + 1}</span>
+    ${item.video ? '' : `<button type="button" class="tray-alt" ${item.describe} data-described="${!!item.alt}" aria-label="${item.alt ? `Edit the description of photo ${i + 1}` : `Describe photo ${i + 1} for people who can’t see it`}">ALT</button>`}
     <button type="button" class="icon-button tray-remove" ${item.remove} aria-label="Remove ${item.video ? 'video' : 'photo'} ${i + 1}">${icon('x')}</button>
   </li>`);
   if (items.length && items.length < MAX_FILES) cells.push(`<li class="add-cell"><label class="tray-add">${icon('plus', 'icon icon-lg')}Add more<input class="sr-only" type="file" accept="image/*,video/*" multiple></label></li>`);
@@ -117,9 +119,15 @@ async function restoreDraft() {
   state.milestoneOn = restored ? !!draft.milestoneOn : !!original?.milestone;
   el.when.value = (restored && draft.when) || localDate(original?.publishedAt);
   state.existing = [...(original?.media || [])];
-  if (restored && Array.isArray(draft.retained)) state.existing = state.existing.filter((m) => draft.retained.includes(m.src));
+  if (restored && Array.isArray(draft.retained)) {
+    // Drafts list kept photos as { src, alt }; older drafts list only src.
+    const kept = new Map(draft.retained.map((entry) => typeof entry === 'string' ? [entry, undefined] : [entry?.src, entry?.alt]));
+    state.existing = state.existing.filter((m) => kept.has(m.src)).map((m) => typeof kept.get(m.src) === 'string' ? { ...m, alt: kept.get(m.src) } : m);
+  }
   if (restored && original && draft.version) original.version = draft.version;
-  state.files = await loadMedia(scope);
+  const saved = await loadMedia(scope);
+  state.files = saved.map(({ file }) => file);
+  for (const { file, alt } of saved) if (alt) state.alts.set(file, alt);
   queuePreviews(state.files);
   renderTray(); autosize(); sync({ persist: false });
   if (restored || state.files.length) el.draft.textContent = 'Draft restored on this device';
@@ -138,6 +146,32 @@ function addFiles(files) {
   queuePreviews(added);
   renderTray(); persistMedia(); sync();
 }
+// Photo descriptions (alt text) for people using screen readers or when a photo cannot load.
+function openDescription(target) {
+  if (state.saving) return;
+  const media = target.file ? null : state.existing[target.index];
+  if (!target.file && !media) return;
+  state.describing = target;
+  const src = target.file ? (state.previews.get(target.file) ? urlFor(target.file) : null) : resolve(media.previewSrc || media.src);
+  $('#alt-preview').hidden = !src;
+  if (src) $('#alt-preview').src = src; else $('#alt-preview').removeAttribute('src');
+  $('#alt-text').value = target.file ? state.alts.get(target.file) || '' : media.alt || '';
+  $('#alt-count').textContent = $('#alt-text').value.length;
+  $('#alt-dialog').showModal();
+  $('#alt-text').focus();
+}
+function saveDescription(event) {
+  event.preventDefault();
+  const target = state.describing, alt = $('#alt-text').value.trim().slice(0, 300);
+  if (target?.file && state.files.includes(target.file)) {
+    if (alt) state.alts.set(target.file, alt); else state.alts.delete(target.file);
+    persistMedia();
+  } else if (target && state.existing[target.index]) {
+    state.existing[target.index] = { ...state.existing[target.index], alt };
+  }
+  $('#alt-dialog').close();
+  renderTray(); sync();
+}
 function draftPost() {
   const author = original?.author || session?.name || 'Community';
   return { id: 'preview', author, initials: original?.initials,
@@ -147,7 +181,7 @@ function draftPost() {
     text: el.text.value.trim(), media: [...state.existing, ...state.files.map((file) => ({
       type: file.type.startsWith('video/') ? 'video' : 'image',
       src: file.type.startsWith('video/') || state.previews.get(file) ? urlFor(file) : '',
-      pendingPreview: file.type.startsWith('image/') && !state.previews.get(file), alt: '',
+      pendingPreview: file.type.startsWith('image/') && !state.previews.get(file), alt: state.alts.get(file) || '',
     }))] };
 }
 function preview() {
@@ -168,7 +202,8 @@ async function submit(event) {
     await mediaSave;
     const post = draftPost();
     const input = { text: post.text, milestone: post.milestone, publishedAt: post.publishedAt,
-      files: [...state.files], retainMedia: state.existing.map((m) => m.src) };
+      files: [...state.files], alts: state.files.map((file) => state.alts.get(file) || ''),
+      retainMedia: state.existing.map((m) => ({ src: m.src, alt: m.alt || '' })) };
     const options = { onStage: (message) => { $('#upload-status').textContent = message; }, ...(editId ? { id: editId, version: original.version } : {}) };
     const saved = await (editId ? updatePost(input, options) : createPost(input, options));
     state.finished = true;
@@ -241,11 +276,14 @@ async function init() {
     const existing = event.target.closest('[data-remove-existing]');
     if (remove) {
       const [file] = state.files.splice(Number(remove.dataset.remove), 1);
-      state.previews.delete(file);
+      state.previews.delete(file); state.alts.delete(file);
       if (state.urls.has(file)) { URL.revokeObjectURL(state.urls.get(file)); state.urls.delete(file); }
       renderTray(); persistMedia(); sync();
     }
     if (existing) { state.existing.splice(Number(existing.dataset.removeExisting), 1); renderTray(); sync(); }
+    const describeNew = event.target.closest('[data-describe]'), describeExisting = event.target.closest('[data-describe-existing]');
+    if (describeNew) openDescription({ file: state.files[Number(describeNew.dataset.describe)] });
+    if (describeExisting) openDescription({ index: Number(describeExisting.dataset.describeExisting) });
     if (event.target.closest('[data-clear-milestone]')) { state.milestoneOn = false; el.milestone.value = ''; sync(); }
   });
   el.milestoneBtn.addEventListener('click', () => {
@@ -253,6 +291,10 @@ async function init() {
     if (state.milestoneOn) el.milestone.focus();
   });
   $('#open-preview').addEventListener('click', preview);
+  $('#alt-form').addEventListener('submit', saveDescription);
+  $('#alt-text').addEventListener('input', () => { $('#alt-count').textContent = $('#alt-text').value.length; });
+  $('#alt-dialog').addEventListener('click', (event) => { if (event.target === $('#alt-dialog') || event.target.closest('[data-close]')) $('#alt-dialog').close(); });
+  $('#alt-dialog').addEventListener('close', () => { state.describing = null; });
   setupCamera({ addFiles, canAdd: () => !state.saving && state.files.length + state.existing.length < MAX_FILES });
   el.sheet.addEventListener('click', (event) => { if (event.target === el.sheet || event.target.closest('[data-close]')) el.sheet.close(); });
   $('#discard-edits').addEventListener('click', async () => {

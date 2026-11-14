@@ -259,7 +259,13 @@ async function readForm(req) {
   try { meta = JSON.parse(field('mediaMeta') || '[]'); retained = form.has('retainMedia') ? JSON.parse(field('retainMedia')) : null; }
   catch { fail(400, 'Invalid media information.'); }
   if (!Array.isArray(meta) || meta.some((m) => !m || typeof m !== 'object' || Array.isArray(m))) fail(400, 'Invalid media information.');
-  if (retained !== null && (!Array.isArray(retained) || retained.some((src) => typeof src !== 'string') || new Set(retained).size !== retained.length)) fail(400, 'Invalid retained photos.');
+  // Kept photos are listed by src, optionally with an updated description: "src" or { src, alt }.
+  if (retained !== null) {
+    if (!Array.isArray(retained)) fail(400, 'Invalid retained photos.');
+    retained = retained.map((entry) => typeof entry === 'string' ? { src: entry } : entry);
+    if (retained.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.src !== 'string' || (entry.alt !== undefined && typeof entry.alt !== 'string'))
+      || new Set(retained.map((entry) => entry.src)).size !== retained.length) fail(400, 'Invalid retained photos.');
+  }
   const files = form.getAll('media').filter((f) => typeof f === 'object' && f.size > 0);
   if (files.length > 20) fail(400, 'Up to 20 photos and videos per post.');
   for (const file of files) if (!EXT[file.type]) fail(415, `Unsupported file type: ${file.type || 'unknown'}.`);
@@ -316,7 +322,7 @@ async function storeMedia(input, publishedAt) {
       const name = `${prefix}-${i + 1}${photo ? '.webp' : EXT[file.type]}`;
       const src = `media/${sub}/${name}`;
       // Track each new file before writing, so partial writes are cleaned too.
-      media.push({ type: file.type.startsWith('video/') ? 'video' : 'image', src, alt: String(input.meta[i]?.alt || '').slice(0, 300) });
+      media.push({ type: file.type.startsWith('video/') ? 'video' : 'image', src, alt: String(input.meta[i]?.alt || '').trim().slice(0, 300) });
       if (photo) {
         const item = media.at(-1);
         Object.assign(item, { width: photo.width, height: photo.height });
@@ -451,10 +457,10 @@ function planUpdate(req, doc, who, id, input) {
   const previous = doc.posts[index];
   requireEdit(who, previous);
   checkVersion(req, previous);
-  const retained = input.retained === null ? (previous.media || []) : input.retained.map((src) => {
+  const retained = input.retained === null ? (previous.media || []) : input.retained.map(({ src, alt }) => {
     const item = (previous.media || []).find((m) => m.src === src);
     if (!item) fail(400, 'A selected photo no longer belongs to this post.');
-    return item;
+    return alt === undefined ? item : { ...item, alt: alt.trim().slice(0, 300) };
   });
   if (!input.text && !retained.length && !input.files.length) fail(400, 'Write something or keep a photo.');
   if (retained.length + input.files.length > 20) fail(400, 'Up to 20 photos and videos per post.');

@@ -1,5 +1,5 @@
 // Service worker for the composer PWA. Bump VERSION when shell files change.
-const VERSION = 'agentglade-compose-v8';
+const VERSION = 'agentglade-compose-v9';
 const SHELL = [
   './',
   '../assets/app.webmanifest',
