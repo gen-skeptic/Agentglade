@@ -89,6 +89,14 @@ test('community pages and all management operations require identity', async () 
   }
   assert.equal((await fetch(base + '/')).status, 200);
 });
+test('every response sends a self-only content security policy and refuses framing', async () => {
+  for (const route of ['/', '/login/', '/compose/', '/api/posts', '/data/posts.json', '/' + shared]) {
+    const response = await fetch(base + route);
+    const policy = response.headers.get('content-security-policy');
+    assert.match(policy, /(^|; )default-src 'self'(;|$)/); assert.match(policy, /(^|; )frame-ancestors 'none'(;|$)/);
+    assert.match(policy, /(^|; )object-src 'none'(;|$)/); assert.equal(response.headers.get('x-frame-options'), 'DENY');
+  }
+});
 test('static paths are percent-decoded exactly once', async () => {
   // A single encoding is the same page and stays behind sign-in.
   for (const route of ['/%63ompose/', '/%6Danage/']) assert.equal((await fetch(base + route)).status, 302);

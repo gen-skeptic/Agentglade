@@ -46,6 +46,12 @@ const MIME = {
   '.gif': 'image/gif', '.avif': 'image/avif', '.heic': 'image/heic', '.heif': 'image/heif', '.tiff': 'image/tiff', '.woff2': 'font/woff2',
   '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
 };
+// Every script, style, font, and image is served from this origin; previews of
+// photos and videos chosen in the composer use blob: URLs. The policy is a second
+// layer behind HTML escaping, and frame-ancestors stops other sites from framing
+// the management pages to trick a signed-in member into clicking Delete.
+const CONTENT_SECURITY_POLICY = ["default-src 'self'", "img-src 'self' blob:", "media-src 'self' blob:", "object-src 'none'",
+  "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'"].join('; ');
 const EXT = Object.fromEntries(Object.entries(MIME).filter(([, m]) => /^(image|video)\//.test(m)).map(([e, m]) => [m, e]));
 EXT['image/jpeg'] = '.jpg';
 // SVG remains available for bundled artwork, but uploaded media is passive.
@@ -544,6 +550,8 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Robots-Tag', 'noindex, nofollow');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(self)');
+  res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+  res.setHeader('X-Frame-Options', 'DENY');
   const url = new URL(req.url.replace(/^\/+/, '/'), 'http://local');
   const { pathname } = url;
   try {
