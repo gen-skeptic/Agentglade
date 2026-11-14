@@ -16,3 +16,7 @@ credentials.json
 *-credentials.json
 *.pem
 *.key
+
+# Private runtime state written when DATA_DIR is the bundled data/ directory
+# (account bindings, edit history, agent receipts and audit logs).
+data/.*
