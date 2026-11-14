@@ -1,0 +1,22 @@
+# Copy and configure for your ingress controller and certificate manager.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentglade
+  namespace: agentglade
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [feed.example.com]
+      secretName: agentglade-tls
+  rules:
+    - host: feed.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agentglade
+                port:
+                  name: http

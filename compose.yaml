@@ -1,0 +1,35 @@
+services:
+  agentglade:
+    build: .
+    image: agentglade:local
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8080}
+      AUTH_CONFIG_FILE: /run/secrets/auth.json
+      AGENT_KEYS_FILE: /run/secrets/agents.json
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-64}
+      MEMBER_ACCOUNTS: '${MEMBER_ACCOUNTS:-{}}'
+      MEMBER_ADMINS: ${MEMBER_ADMINS:-[]}
+      MEMBER_ROLES: ${MEMBER_ROLES:-[]}
+    secrets:
+      - source: auth
+        target: auth.json
+      - source: agents
+        target: agents.json
+    volumes:
+      - posts:/data
+      - media:/media
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+secrets:
+  auth:
+    file: ./secrets/auth.json
+  agents:
+    file: ./secrets/agents.json
+volumes:
+  posts:
+  media:

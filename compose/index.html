@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" data-theme="mocha">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>New post · Agentglade</title>
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#181825">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agentglade">
+  <link rel="manifest" href="../assets/app.webmanifest">
+  <link rel="icon" href="../assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="../assets/img/apple-touch-icon.png">
+  <script src="../assets/js/theme.js?v=8"></script>
+  <link rel="stylesheet" href="../assets/fonts/fonts.css">
+  <link rel="stylesheet" href="../assets/css/terminal.css">
+  <link rel="stylesheet" href="../assets/css/site.css?v=8">
+  <link rel="stylesheet" href="../assets/css/community.css?v=8">
+  <link rel="stylesheet" href="../assets/css/compose.css?v=8">
+  <script type="module" src="../assets/js/compose.js?v=8"></script>
+</head>
+<body class="compose-page">
+  <form class="composer" id="composer" novalidate>
+    <header class="compose-bar">
+      <a class="icon-button" href="../manage/" aria-label="Close and go to past posts"><i data-icon="x"></i></a>
+      <h1 class="compose-title" id="compose-title">New post</h1>
+      <button class="button button-primary compose-submit" type="submit" id="post-btn" disabled>Post</button>
+    </header>
+
+    <nav class="community-nav" aria-label="Community pages">
+      <a href="./" id="nav-new" aria-current="page"><i data-icon="plus"></i>New post</a>
+      <a href="../manage/" id="nav-manage"><i data-icon="layers"></i>Past posts</a>
+      <a href="../profiles/"><i data-icon="user"></i>Profiles</a>
+    <a href="../"><i data-icon="home"></i>View feed</a>
+    </nav>
+    <fieldset class="compose-fields" id="compose-fields" disabled>
+
+    <main class="compose-main">
+      <div class="compose-author">
+        <span class="avatar" id="me-initials" aria-hidden="true">?</span>
+        <div>
+          <span class="post-author" id="me-name">Signed in</span>
+          <span class="compose-audience"><i data-icon="eye"></i>Public feed</span>
+        </div>
+        <a class="icon-button compose-signout" id="sign-out" href="#" aria-label="Sign out" hidden><i data-icon="logout"></i></a>
+      </div>
+
+      <label class="sr-only" for="text">Post text</label>
+      <p id="edit-context" class="community-note" hidden></p>
+      <p id="edit-error" class="form-error" role="alert" hidden></p>
+      <textarea class="compose-text" id="text" name="text" rows="4" placeholder="Share an update with your community." maxlength="20000" enterkeyhint="enter"></textarea>
+
+      <div class="compose-chips" id="chips"></div>
+
+      <section class="compose-media" aria-label="Photos and videos">
+        <ul class="tray" id="tray"></ul>
+        <p class="compose-media-help">Photos are automatically optimized up to 4K. Smaller previews keep the feed fast.</p>
+        <p class="compose-media-help" id="preview-status" role="status" hidden>Preparing photo previews…</p>
+      </section>
+
+      <section class="compose-details" id="details" aria-label="Post details">
+        <label class="detail-row" id="milestone-row" hidden>
+          <span class="detail-icon lavender"><i data-icon="flag"></i></span>
+          <span class="detail-label">Milestone</span>
+          <input class="input detail-input" type="text" id="milestone" name="milestone" placeholder="Launch, highlight, achievement…" maxlength="60" enterkeyhint="done">
+        </label>
+        <label class="detail-row">
+          <span class="detail-icon"><i data-icon="calendar"></i></span>
+          <span class="detail-label">When</span>
+          <input class="input detail-input" type="datetime-local" id="when" name="when">
+        </label>
+      </section>
+
+      <p class="compose-draft" id="draft-status" aria-live="polite"></p>
+      <p class="compose-upload-status" id="upload-status" role="status" aria-live="polite" hidden></p>
+      <button type="button" class="community-text-button" id="discard-edits" hidden>Discard edits and reload saved post</button>
+    </main>
+
+    <nav class="compose-tools" aria-label="Add to your post">
+      <span class="tools-label">Add to your post</span>
+      <div class="tools">
+        <label class="tool">
+          <input class="sr-only" type="file" id="pick-library" accept="image/*,video/*" multiple>
+          <i data-icon="image" class="icon-lg"></i><span>Photos</span>
+        </label>
+        <button type="button" class="tool" id="open-camera">
+          <i data-icon="camera" class="icon-lg"></i><span>Camera</span>
+        </button>
+        <button type="button" class="tool" id="toggle-milestone" aria-pressed="false">
+          <i data-icon="flag" class="icon-lg"></i><span>Milestone</span>
+        </button>
+        <button type="button" class="tool" id="open-preview">
+          <i data-icon="eye" class="icon-lg"></i><span>Preview</span>
+        </button>
+      </div>
+    </nav>
+    </fieldset>
+  </form>
+
+  <dialog class="sheet" id="preview-sheet" aria-labelledby="preview-title">
+    <div class="sheet-bar">
+      <h2 class="compose-title" id="preview-title">Preview</h2>
+      <button type="button" class="icon-button" data-close aria-label="Close preview"><i data-icon="x"></i></button>
+    </div>
+    <div class="sheet-body" id="preview-body"></div>
+  </dialog>
+
+  <dialog class="sheet camera-sheet" id="camera-dialog" aria-labelledby="camera-title">
+    <div class="sheet-bar">
+      <h2 class="compose-title" id="camera-title">Take a photo</h2>
+      <button type="button" class="icon-button" id="camera-close" aria-label="Close camera"><i data-icon="x"></i></button>
+    </div>
+    <div class="camera-body">
+      <video id="camera-video" autoplay muted playsinline aria-label="Camera viewfinder"></video>
+      <p id="camera-status" role="status" aria-live="polite">Opening camera…</p>
+      <div class="camera-actions">
+        <button type="button" class="button" id="camera-flip" disabled>Switch camera</button>
+        <button type="button" class="button button-primary" id="camera-shutter" disabled>Take photo</button>
+      </div>
+      <label class="camera-native">Use phone camera
+        <input class="sr-only" type="file" id="pick-camera" accept="image/*" capture="environment">
+      </label>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>
